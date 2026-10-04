@@ -122,7 +122,12 @@ def load_dataset_manifest(path: str | Path) -> dict[str, Any]:
     return manifest
 
 
-def validate_dataset_manifest(manifest: dict[str, Any], dataset_root: str | Path, probe: dict[str, Any]) -> None:
+def validate_dataset_manifest(
+    manifest: dict[str, Any],
+    dataset_root: str | Path,
+    probe: dict[str, Any],
+    probe_path: str | Path | None = None,
+) -> None:
     if manifest.get("schema_version") != DATASET_MANIFEST_SCHEMA:
         raise ValueError("Unsupported dataset manifest schema")
     if manifest.get("manifest_id") != MANIFEST_ID:
@@ -158,7 +163,12 @@ def validate_dataset_manifest(manifest: dict[str, Any], dataset_root: str | Path
         raise ValueError("Probe order or filenames do not match dataset manifest")
     if any(name not in train_names for name in probe_names):
         raise ValueError("Probe contains an image outside TRAIN")
-    if manifest["probe_reference"].get("sha256") != sha256_file(Path(manifest["probe_reference"]["path"])):
+    actual_probe_path = Path(probe_path) if probe_path is not None else Path(manifest["probe_reference"]["path"])
+    if not actual_probe_path.is_file():
+        raise FileNotFoundError(f"Probe file not found: {actual_probe_path}")
+    if Path(manifest["probe_reference"]["path"]).name != actual_probe_path.name:
+        raise ValueError("Probe path basename does not match manifest reference")
+    if manifest["probe_reference"].get("sha256") != sha256_file(actual_probe_path):
         raise ValueError("Probe file changed from manifest reference")
 
 

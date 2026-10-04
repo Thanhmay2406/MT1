@@ -125,7 +125,12 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
         dataset_manifest = load_dataset_manifest(paths["dataset_manifest"])
         if dataset_manifest.get("schema_version") != DATASET_MANIFEST_SCHEMA:
             raise ValueError("Unsupported dataset manifest schema")
-        validate_dataset_manifest(dataset_manifest, paths["images_root"].parent, json.loads(paths["probe"].read_text(encoding="utf-8")))
+        validate_dataset_manifest(
+            dataset_manifest,
+            paths["images_root"].parent,
+            json.loads(paths["probe"].read_text(encoding="utf-8")),
+            probe_path=paths["probe"],
+        )
     elif require_dataset:
         raise FileNotFoundError("Frozen dataset manifest is required for scientific E3")
     probe = load_probe(paths["probe"])
