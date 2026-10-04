@@ -21,12 +21,14 @@ EXPECTED_CATEGORY_IDS = [0, 1, 2, 3, 4, 5]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="E1 eligibility code-only entrypoint")
+    parser = argparse.ArgumentParser(description="E1 eligibility entrypoint")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--probe", required=True)
     parser.add_argument("--images-root", required=True)
     parser.add_argument("--output")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--allow-any-hash",
         action="store_true",
@@ -101,11 +103,87 @@ def dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_image_files(probe: dict, images_root: Path) -> None:
+    missing = [
+        str(images_root / image["file_name"])
+        for image in probe["images"]
+        if not (images_root / image["file_name"]).is_file()
+    ]
+    if missing:
+        preview = ", ".join(missing[:3])
+        raise FileNotFoundError(f"Probe references {len(missing)} missing image(s): {preview}")
+
+
+def _resolve_device(requested: str) -> str:
+    import torch
+
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available")
+        return "cuda"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def run_real(args: argparse.Namespace) -> int:
+    if not args.output:
+        raise ValueError("--output is required unless --dry-run is used")
+
+    checkpoint = Path(args.checkpoint)
+    probe_path = Path(args.probe)
+    images_root = Path(args.images_root)
+    output = Path(args.output)
+    if output.exists() and not args.overwrite:
+        raise FileExistsError(f"Output already exists; pass --overwrite to replace it: {output}")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    if not probe_path.is_file():
+        raise FileNotFoundError(f"Probe not found: {probe_path}")
+    if not images_root.is_dir():
+        raise FileNotFoundError(f"Images root not found: {images_root}")
+
+    checkpoint_sha256 = assert_file_sha256(checkpoint, EXPECTED_CHECKPOINT_SHA256)
+    probe_sha256 = assert_file_sha256(probe_path, EXPECTED_PROBE_SHA256)
+    probe = load_probe(probe_path)
+    validate_probe_schema(probe, strict_frozen_probe=True)
+    _validate_image_files(probe, images_root)
+
+    device = _resolve_device(args.device)
+    from artifacts import write_json_artifact
+    from detector import load_detector_checkpoint
+    from eligibility import build_eligibility_artifact
+    from inference import predict_probe
+
+    model, metadata = load_detector_checkpoint(checkpoint, device=device)
+    predictions = predict_probe(
+        model,
+        probe,
+        images_root,
+        device=device,
+        label_to_category_id=metadata["label_to_category_id"],
+    )
+    artifact = build_eligibility_artifact(
+        probe,
+        predictions,
+        checkpoint_sha256=checkpoint_sha256,
+        probe_sha256=probe_sha256,
+    )
+    write_json_artifact(output, artifact)
+    print("E1_OK")
+    print(f"device={device}")
+    print(f"output={output}")
+    print(f"image_count={artifact.image_count}")
+    print(f"eligible_image_count={artifact.eligible_image_count}")
+    print(f"eligible_instance_count={artifact.eligible_instance_count}")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     if args.dry_run:
         return dry_run(args)
-    raise SystemExit("Full E1 detector inference is outside this code-only implementation.")
+    return run_real(args)
 
 
 if __name__ == "__main__":
