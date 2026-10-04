@@ -8,6 +8,7 @@ from typing import Any
 
 
 E2_SCHEMA_VERSION = "causal_audit_e2_importance/v1"
+E3_SCHEMA_VERSION = "causal_audit_e3_damage/v1"
 
 
 def write_json_artifact(path: str | Path, payload: Any) -> None:
@@ -95,4 +96,56 @@ def read_e2_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
     if payload.get("schema_version") != E2_SCHEMA_VERSION:
         raise ValueError("Unsupported E2 artifact schema")
+    return payload
+
+
+def build_e3_artifact(
+    *,
+    checkpoint_sha256: str,
+    probe_sha256: str,
+    eligibility_sha256: str,
+    importance_sha256: str,
+    dataset_manifest_sha256: str,
+    channel_manifest_sha256: str,
+    sample_id: str,
+    sample_identity_sha256: str,
+    matching_iou_threshold: float,
+    channel_ids: list[str],
+    image_count: int,
+    pairs: list[dict],
+) -> dict:
+    expected_pair_count = len(channel_ids) * int(image_count)
+    pair_keys = [(row.get("canonical_id"), int(row.get("image_id"))) for row in pairs]
+    if len(set(pair_keys)) != len(pair_keys):
+        raise ValueError("E3 artifact contains duplicate channel-image pairs")
+    if len(set(channel_ids)) != len(channel_ids):
+        raise ValueError("E3 channel IDs must be unique")
+    allowed = set(channel_ids)
+    if any(key[0] not in allowed for key in pair_keys):
+        raise ValueError("E3 pair references an undeclared channel")
+    return {
+        "schema_version": E3_SCHEMA_VERSION,
+        "checkpoint_sha256": checkpoint_sha256,
+        "probe_sha256": probe_sha256,
+        "eligibility_sha256": eligibility_sha256,
+        "importance_sha256": importance_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "channel_manifest_sha256": channel_manifest_sha256,
+        "sample_id": sample_id,
+        "sample_identity_sha256": sample_identity_sha256,
+        "matching_iou_threshold": float(matching_iou_threshold),
+        "channel_count": len(channel_ids),
+        "image_count": int(image_count),
+        "expected_pair_count": expected_pair_count,
+        "completed_pair_count": len(pairs),
+        "complete": len(pairs) == expected_pair_count and all(row.get("status") == "ok" for row in pairs),
+        "channel_ids": channel_ids,
+        "pairs": pairs,
+    }
+
+
+def read_e3_artifact(path: str | Path) -> dict:
+    payload = read_json_artifact(path)
+    if payload.get("schema_version") != E3_SCHEMA_VERSION:
+        raise ValueError("Unsupported E3 artifact schema")
     return payload
