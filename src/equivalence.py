@@ -33,12 +33,16 @@ def _parent_and_attribute(model: Any, module_name: str):
     return parent, attribute
 
 
-def _kept_indices(width: int, removed: int):
+def _kept_indices(width: int, removed: int, device):
     import torch
 
     if removed < 0 or removed >= width:
         raise ValueError(f"Channel index {removed} outside width {width}")
-    return torch.tensor([index for index in range(width) if index != removed], dtype=torch.long)
+    return torch.tensor(
+        [index for index in range(width) if index != removed],
+        dtype=torch.long,
+        device=device,
+    )
 
 
 def _replace_producer(producer: Any, channel_index: int):
@@ -49,7 +53,7 @@ def _replace_producer(producer: Any, channel_index: int):
         raise TypeError("Physical removal producer must be Conv2d")
     if producer.groups != 1:
         raise ValueError("Physical removal currently requires an ungrouped producer Conv2d")
-    kept = _kept_indices(producer.out_channels, channel_index)
+    kept = _kept_indices(producer.out_channels, channel_index, producer.weight.device)
     replacement = nn.Conv2d(
         producer.in_channels,
         producer.out_channels - 1,
@@ -77,7 +81,8 @@ def _replace_norm(norm: Any, channel_index: int):
 
     if not isinstance(norm, nn.BatchNorm2d):
         raise TypeError("Physical removal normalization must be BatchNorm2d")
-    kept = _kept_indices(norm.num_features, channel_index)
+    norm_device = norm.weight.device if norm.affine else norm.running_mean.device
+    kept = _kept_indices(norm.num_features, channel_index, norm_device)
     replacement = nn.BatchNorm2d(
         norm.num_features - 1,
         eps=norm.eps,
@@ -107,7 +112,7 @@ def _replace_consumer(consumer: Any, channel_index: int):
         raise TypeError("Physical removal consumer must be Conv2d")
     if consumer.groups != 1:
         raise ValueError("Physical removal currently requires an ungrouped consumer Conv2d")
-    kept = _kept_indices(consumer.in_channels, channel_index)
+    kept = _kept_indices(consumer.in_channels, channel_index, consumer.weight.device)
     replacement = nn.Conv2d(
         consumer.in_channels - 1,
         consumer.out_channels,
