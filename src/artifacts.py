@@ -11,6 +11,7 @@ from typing import Any
 E2_SCHEMA_VERSION = "causal_audit_e2_importance/v1"
 E3_SCHEMA_VERSION = "causal_audit_e3_damage/v1"
 E4_SCHEMA_VERSION = "causal_audit_e4_equivalence/v1"
+E5_SCHEMA_VERSION = "causal_audit_e5_statistics/v1"
 
 
 def write_json_artifact(path: str | Path, payload: Any) -> None:
@@ -215,4 +216,72 @@ def read_e4_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
     if payload.get("schema_version") != E4_SCHEMA_VERSION:
         raise ValueError("Unsupported E4 artifact schema")
+    return payload
+
+
+def build_e5_artifact(
+    *,
+    checkpoint_sha256: str,
+    probe_sha256: str,
+    eligibility_sha256: str,
+    importance_sha256: str,
+    intervention_sha256: str,
+    equivalence_sha256: str,
+    dataset_manifest_sha256: str,
+    channel_manifest_sha256: str,
+    equivalence_status: str,
+    matching_iou_threshold: float,
+    eligible_image_count: int,
+    eligible_instance_count: int,
+    channel_rows: list[dict],
+    group_statistics: dict,
+    macro_statistics: dict,
+    paired_differences: dict,
+    hypotheses: dict,
+    bootstrap: dict,
+    permutation: dict,
+) -> dict:
+    canonical_ids = [row.get("canonical_id") for row in channel_rows]
+    if len(channel_rows) != 384 or len(set(canonical_ids)) != 384:
+        raise ValueError("E5 requires 384 unique channel rows")
+    if len(group_statistics) != 32:
+        raise ValueError("E5 requires 32 structural groups")
+    for row in channel_rows:
+        for field in ("damage",):
+            if not math.isfinite(float(row[field])):
+                raise ValueError("E5 damage values must be finite")
+        for method in ("gxa", "activation", "l1", "taylor"):
+            if not math.isfinite(float(row["scores"][method]["raw"])):
+                raise ValueError("E5 importance values must be finite")
+    return {
+        "schema_version": E5_SCHEMA_VERSION,
+        "checkpoint_sha256": checkpoint_sha256,
+        "probe_sha256": probe_sha256,
+        "eligibility_sha256": eligibility_sha256,
+        "importance_sha256": importance_sha256,
+        "intervention_sha256": intervention_sha256,
+        "equivalence_sha256": equivalence_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "channel_manifest_sha256": channel_manifest_sha256,
+        "equivalence_status": equivalence_status,
+        "matching_iou_threshold": float(matching_iou_threshold),
+        "group_count": 32,
+        "channel_count": 384,
+        "eligible_image_count": int(eligible_image_count),
+        "eligible_instance_count": int(eligible_instance_count),
+        "bootstrap": bootstrap,
+        "permutation": permutation,
+        "channel_rows": channel_rows,
+        "group_statistics": group_statistics,
+        "macro_statistics": macro_statistics,
+        "paired_differences": paired_differences,
+        "hypotheses": hypotheses,
+        "complete": True,
+    }
+
+
+def read_e5_artifact(path: str | Path) -> dict:
+    payload = read_json_artifact(path)
+    if payload.get("schema_version") != E5_SCHEMA_VERSION:
+        raise ValueError("Unsupported E5 artifact schema")
     return payload
