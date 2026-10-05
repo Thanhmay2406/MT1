@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 E2_SCHEMA_VERSION = "causal_audit_e2_importance/v1"
 E3_SCHEMA_VERSION = "causal_audit_e3_damage/v1"
+E4_SCHEMA_VERSION = "causal_audit_e4_equivalence/v1"
 
 
 def write_json_artifact(path: str | Path, payload: Any) -> None:
@@ -148,4 +150,69 @@ def read_e3_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
     if payload.get("schema_version") != E3_SCHEMA_VERSION:
         raise ValueError("Unsupported E3 artifact schema")
+    return payload
+
+
+def build_e4_artifact(
+    *,
+    checkpoint_sha256: str,
+    probe_sha256: str,
+    eligibility_sha256: str,
+    importance_sha256: str,
+    intervention_sha256: str,
+    dataset_manifest_sha256: str,
+    channel_manifest_sha256: str,
+    e4_sample_sha256: str,
+    sample_id: str,
+    sample_identity_sha256: str,
+    tolerance: float,
+    channel_ids: list[str],
+    image_ids: list[int],
+    pairs: list[dict],
+) -> dict:
+    expected_pair_count = len(channel_ids) * len(image_ids)
+    keys = [(row.get("canonical_id"), int(row.get("image_id"))) for row in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("E4 artifact contains duplicate channel-image pairs")
+    if len(set(channel_ids)) != len(channel_ids) or len(set(image_ids)) != len(image_ids):
+        raise ValueError("E4 sample identities must be unique")
+    if any(channel not in set(channel_ids) for channel, _ in keys) or any(image not in set(image_ids) for _, image in keys):
+        raise ValueError("E4 pair references an undeclared sample identity")
+    for row in pairs:
+        for field in ("max_utility_abs_difference", "max_damage_abs_difference"):
+            value = float(row.get(field, float("nan")))
+            if not math.isfinite(value):
+                raise ValueError("E4 comparison values must be finite")
+    complete = len(pairs) == expected_pair_count and all(row.get("status") == "ok" for row in pairs)
+    equivalent = complete and all(row.get("equivalent") is True for row in pairs)
+    return {
+        "schema_version": E4_SCHEMA_VERSION,
+        "checkpoint_sha256": checkpoint_sha256,
+        "probe_sha256": probe_sha256,
+        "eligibility_sha256": eligibility_sha256,
+        "importance_sha256": importance_sha256,
+        "intervention_sha256": intervention_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "channel_manifest_sha256": channel_manifest_sha256,
+        "e4_sample_sha256": e4_sample_sha256,
+        "sample_id": sample_id,
+        "sample_identity_sha256": sample_identity_sha256,
+        "tolerance": float(tolerance),
+        "channel_count": len(channel_ids),
+        "image_count": len(image_ids),
+        "expected_pair_count": expected_pair_count,
+        "completed_pair_count": len(pairs),
+        "equivalent_pair_count": sum(row.get("equivalent") is True for row in pairs),
+        "complete": complete,
+        "equivalence_status": "equivalent" if equivalent else ("non_equivalent" if complete else "incomplete"),
+        "channel_ids": channel_ids,
+        "image_ids": image_ids,
+        "pairs": pairs,
+    }
+
+
+def read_e4_artifact(path: str | Path) -> dict:
+    payload = read_json_artifact(path)
+    if payload.get("schema_version") != E4_SCHEMA_VERSION:
+        raise ValueError("Unsupported E4 artifact schema")
     return payload

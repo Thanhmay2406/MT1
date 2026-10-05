@@ -1,0 +1,149 @@
+{
+  "channel_count": 8,
+  "channel_manifest_sha256": "c39bfcec29744c6c3c01024fba89515114f49f7fbbe07d29bd7d8ead3fdeea99",
+  "channels": [
+    {
+      "canonical_id": "backbone.body.layer1.0.conv1|channel=28",
+      "consumer_name": "backbone.body.layer1.0.conv2",
+      "group_id": "layer1.0.conv1",
+      "local_channel_index": 28,
+      "norm_name": "backbone.body.layer1.0.bn1",
+      "producer_name": "backbone.body.layer1.0.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer1.2.conv1|channel=28",
+      "consumer_name": "backbone.body.layer1.2.conv2",
+      "group_id": "layer1.2.conv1",
+      "local_channel_index": 28,
+      "norm_name": "backbone.body.layer1.2.bn1",
+      "producer_name": "backbone.body.layer1.2.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer2.1.conv1|channel=87",
+      "consumer_name": "backbone.body.layer2.1.conv2",
+      "group_id": "layer2.1.conv1",
+      "local_channel_index": 87,
+      "norm_name": "backbone.body.layer2.1.bn1",
+      "producer_name": "backbone.body.layer2.1.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer2.3.conv1|channel=41",
+      "consumer_name": "backbone.body.layer2.3.conv2",
+      "group_id": "layer2.3.conv1",
+      "local_channel_index": 41,
+      "norm_name": "backbone.body.layer2.3.bn1",
+      "producer_name": "backbone.body.layer2.3.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer3.1.conv1|channel=219",
+      "consumer_name": "backbone.body.layer3.1.conv2",
+      "group_id": "layer3.1.conv1",
+      "local_channel_index": 219,
+      "norm_name": "backbone.body.layer3.1.bn1",
+      "producer_name": "backbone.body.layer3.1.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer3.3.conv1|channel=114",
+      "consumer_name": "backbone.body.layer3.3.conv2",
+      "group_id": "layer3.3.conv1",
+      "local_channel_index": 114,
+      "norm_name": "backbone.body.layer3.3.bn1",
+      "producer_name": "backbone.body.layer3.3.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer3.5.conv1|channel=175",
+      "consumer_name": "backbone.body.layer3.5.conv2",
+      "group_id": "layer3.5.conv1",
+      "local_channel_index": 175,
+      "norm_name": "backbone.body.layer3.5.bn1",
+      "producer_name": "backbone.body.layer3.5.conv1"
+    },
+    {
+      "canonical_id": "backbone.body.layer4.1.conv1|channel=486",
+      "consumer_name": "backbone.body.layer4.1.conv2",
+      "group_id": "layer4.1.conv1",
+      "local_channel_index": 486,
+      "norm_name": "backbone.body.layer4.1.bn1",
+      "producer_name": "backbone.body.layer4.1.conv1"
+    }
+  ],
+  "checkpoint_sha256": "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0",
+  "dataset_manifest_sha256": "fce7c5bc78d606c641873220f124d4656f1c32d96c7ca1e2dbc7b0b4d4f6536f",
+  "eligibility_sha256": "d8b5ee08f53cad957ab97cde675758c3b8ca297a7186da729352b0f0fdf4425a",
+  "image_count": 16,
+  "images": [
+    {
+      "file_name": "S77_Image__2025-09-08__16-07-09_dark_2_crop_4_jpg.rf.f6941c0ab2e64bca35cc656e50aafa2e.jpg",
+      "image_id": 108
+    },
+    {
+      "file_name": "S224_Image__2025-07-01__11-12-01_bright_2_crop_7_jpg.rf.b4ded34ac6907817441a1b55098e4da0.jpg",
+      "image_id": 114
+    },
+    {
+      "file_name": "S43_Image__2025-09-05__10-08-00_bright_2_crop_2_jpg.rf.a39e17d5d339d8a1e1fd925392d9df46.jpg",
+      "image_id": 1179
+    },
+    {
+      "file_name": "S260_Image__2025-11-14__14-58-21_bright_3_crop_4_jpg.rf.6bc5edf060fd15f72174a434a7716bdf.jpg",
+      "image_id": 1282
+    },
+    {
+      "file_name": "S260_Image__2025-11-14__14-57-25_bright_2_crop_5_jpg.rf.7d555ca88560b43edeb646d396658020.jpg",
+      "image_id": 1382
+    },
+    {
+      "file_name": "S82_Image__2025-09-08__18-09-01_dark_2_crop_8_jpg.rf.1acc521ad1fae1394de042a95902e678.jpg",
+      "image_id": 1624
+    },
+    {
+      "file_name": "S257_Image__2025-11-14__14-25-42_bright_3_crop_3_jpg.rf.577a9969d10910880285de4e138dbbe5.jpg",
+      "image_id": 1631
+    },
+    {
+      "file_name": "S234_Image__2025-11-05__14-54-46_bright_2_crop_7_jpg.rf.12cd0e0e3b2a9da9a9273b4cc5d239d8.jpg",
+      "image_id": 1647
+    },
+    {
+      "file_name": "S32_Image__2025-09-04__13-49-31_bright_2_crop_7_jpg.rf.7396a0f7b9820c79e3f5012c8c73d10b.jpg",
+      "image_id": 1786
+    },
+    {
+      "file_name": "S76_Image__2025-09-08__15-51-51_bright_4_crop_6_jpg.rf.e16bd4001dee9a4bf424cca40eb12551.jpg",
+      "image_id": 1791
+    },
+    {
+      "file_name": "S133_Image__2025-09-23__15-39-46_bright_2_crop_3_jpg.rf.9bfe6fe912ac2e4ae2bbb8f4f23c4ad0.jpg",
+      "image_id": 2688
+    },
+    {
+      "file_name": "S282_Image__2025-11-17__14-09-36_bright_2_crop_2_jpg.rf.5edb7484a75059b9c25e5705d5f17e84.jpg",
+      "image_id": 3181
+    },
+    {
+      "file_name": "S255_Image__2025-11-11__14-23-04_dark_4_crop_4_jpg.rf.6455a807eb4e8bc7e96e2a6e6a044a74.jpg",
+      "image_id": 3496
+    },
+    {
+      "file_name": "S260_Image__2025-11-14__14-55-59_dark_2_crop_4_jpg.rf.821518c79bb8e71c42530dbe878dabd1.jpg",
+      "image_id": 3786
+    },
+    {
+      "file_name": "S129_Image__2025-09-10__11-22-31_bright_2_crop_6_jpg.rf.1ea08eb0cdb67f85823a6c25ef1eb56e.jpg",
+      "image_id": 4133
+    },
+    {
+      "file_name": "S66_Image__2025-09-08__10-45-44_bright_3_crop_5_jpg.rf.94ff170c140753f61636ec59ce0a68a6.jpg",
+      "image_id": 4212
+    }
+  ],
+  "importance_sha256": "ad365f85b7919387e86cd11451fcf484f79d08f7640dcc31a4c4c3f1e478412a",
+  "intervention_sha256": "5846bf0cbbc3894a8a0d4bf48da393b20ea9a0586f8f627fa1ba73095f0377bc",
+  "probe_sha256": "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d",
+  "sample_id": "sb_e4_equivalence_8x16",
+  "sample_identity_sha256": "a54bf6b230ead7ea329648e970a9d210923e1359908a9e6d275de8640b31655b",
+  "sample_sha256": "f455aa1ab25a4dd75289c5661ba800f0354fc819b9798806369b819492007029",
+  "sampling_rule": "8 evenly spaced structural groups; one SHA-256-ranked channel per group; 16 SHA-256-ranked eligible TRAIN images; restore probe order",
+  "sampling_seed_id": "sha256:causal_audit_e4_equivalence/v1|sb_e1_sample_554d7f387c8baeea",
+  "schema_version": "causal_audit_e4_equivalence_sample/v1"
+}
