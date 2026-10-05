@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,8 @@ EXPECTED_E2_SCHEMA = "causal_audit_e2_importance/v1"
 EXPECTED_PROBE_IMAGES = 300
 EXPECTED_PROBE_ANNOTATIONS = 372
 MATCHING_IOU_THRESHOLD = 0.5
+DEFAULT_PROGRESS_EVERY = 500
+DEFAULT_CHECKPOINT_EVERY = 5000
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,8 +56,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-every",
         type=int,
-        default=500,
-        help="Persist resumable artifact after this many new pairs (default: 500)",
+        default=DEFAULT_CHECKPOINT_EVERY,
+        help=f"Persist resumable artifact after this many new pairs (default: {DEFAULT_CHECKPOINT_EVERY})",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=DEFAULT_PROGRESS_EVERY,
+        help=f"Print aggregate progress after this many processed pairs (default: {DEFAULT_PROGRESS_EVERY})",
     )
     return parser.parse_args()
 
@@ -121,8 +130,8 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
     required_files = ("checkpoint", "probe", "eligibility", "importance", "channel_manifest")
     if any(not paths[name].is_file() for name in required_files) or not paths["images_root"].is_dir():
         raise FileNotFoundError("Checkpoint, probe, E1, E2, channel manifest, and images root are required")
-    if args.checkpoint_every < 1:
-        raise ValueError("--checkpoint-every must be positive")
+    if args.checkpoint_every < 1 or args.progress_every < 1:
+        raise ValueError("--checkpoint-every and --progress-every must be positive")
     checkpoint_sha256 = assert_file_sha256(paths["checkpoint"], EXPECTED_CHECKPOINT_SHA256)
     probe_sha256 = assert_file_sha256(paths["probe"], EXPECTED_PROBE_SHA256)
     channel_manifest_sha256 = assert_file_sha256(paths["channel_manifest"], FROZEN_CHANNEL_MANIFEST_SHA256)
@@ -208,6 +217,74 @@ def _detections_from_output(output: dict, label_to_category_id: dict[int, int]):
     return [detection_from_prediction(output, index, label_to_category_id) for index in range(len(output["boxes"]))]
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+class ProgressReporter:
+    """Low-volume stdout progress reporting for long scientific runs."""
+
+    def __init__(self, total: int, progress_every: int, *, clock=time.perf_counter, emit=print):
+        if total < 1 or progress_every < 1:
+            raise ValueError("Progress total and interval must be positive")
+        self.total = total
+        self.progress_every = progress_every
+        self.clock = clock
+        self.emit = emit
+        self.started_at = clock()
+        self.last_reported = 0
+
+    def _write(self, message: str) -> None:
+        self.emit(message, flush=True)
+
+    def resume(self, completed: int) -> None:
+        if completed:
+            self._write(f"E3_RESUME completed={completed}/{self.total}")
+
+    def pair_processed(self, completed: int, current: str) -> None:
+        if completed < self.total and completed % self.progress_every != 0:
+            return
+        elapsed = self.clock() - self.started_at
+        rate = completed / elapsed if elapsed > 0 else 0.0
+        remaining = max(0, self.total - completed)
+        eta = remaining / rate if rate > 0 else 0.0
+        self.last_reported = completed
+        self._write(
+            "E3_PROGRESS "
+            f"completed={completed}/{self.total} "
+            f"percent={100.0 * completed / self.total:.2f} "
+            f"rate={rate:.2f} pairs/s "
+            f"elapsed={_format_duration(elapsed)} "
+            f"eta={_format_duration(eta)} "
+            f"current={current}"
+        )
+
+    def channel_done(self, channel_index: int, channel_count: int, canonical_id: str, completed: int) -> None:
+        self._write(
+            f"E3_CHANNEL_DONE channel={channel_index}/{channel_count} "
+            f"canonical_id={canonical_id} completed={completed}"
+        )
+
+    def checkpoint(self, completed: int, output: Path, write_seconds: float) -> None:
+        self._write(
+            f"E3_CHECKPOINT completed={completed}/{self.total} "
+            f"output={output} write_seconds={write_seconds:.2f}"
+        )
+
+    def pair_error(self, canonical_id: str, image_id: int, error: Exception) -> None:
+        self._write(
+            f"E3_PAIR_ERROR canonical_id={canonical_id} image_id={image_id} "
+            f"error_type={type(error).__name__} error={error}"
+        )
+
+
 def _ordered_pairs(data: dict, pairs: list[dict]) -> list[dict]:
     channel_order = {
         f"{entry['producer_name']}|channel={int(entry['local_channel_index'])}": index
@@ -243,10 +320,23 @@ def run_real(args: argparse.Namespace) -> int:
     import torch
     from PIL import Image
 
+    run_started_at = time.perf_counter()
+    preflight_started_at = time.perf_counter()
     data = _validate_inputs(args, require_dataset=True)
+    print(f"E3_PREFLIGHT_OK elapsed={_format_duration(time.perf_counter() - preflight_started_at)}", flush=True)
     device = resolve_device(args.device)
+    model_started_at = time.perf_counter()
     model, metadata = load_detector_checkpoint(data["paths"]["checkpoint"], device=device)
+    print(
+        f"E3_MODEL_LOADED device={device} elapsed={_format_duration(time.perf_counter() - model_started_at)}",
+        flush=True,
+    )
+    guard_started_at = time.perf_counter()
     state_guard = ModelStateGuard(model)
+    print(
+        f"E3_STATE_GUARD_READY elapsed={_format_duration(time.perf_counter() - guard_started_at)}",
+        flush=True,
+    )
     groups = discover_structural_groups(model)
     group_by_id = {group.group_id: group for group in groups}
     specs = _build_specs(data["manifest"])
@@ -274,18 +364,28 @@ def run_real(args: argparse.Namespace) -> int:
             raise ValueError("Resume artifact channel order does not match frozen manifest")
         pair_rows = {(row["canonical_id"], int(row["image_id"])): row for row in previous.get("pairs", [])}
         existing = {key: row for key, row in pair_rows.items() if row.get("status") == "ok"}
+    total_pairs = len(specs) * EXPECTED_PROBE_IMAGES
+    reporter = ProgressReporter(total_pairs, args.progress_every)
+    reporter.resume(len(existing))
+    existing_by_channel: dict[str, int] = {spec.canonical_id: 0 for spec in specs}
+    for row in existing.values():
+        existing_by_channel[row["canonical_id"]] += 1
+    announced_channels = {
+        canonical_id for canonical_id, count in existing_by_channel.items() if count == EXPECTED_PROBE_IMAGES
+    }
     annotations_by_image: dict[int, list[dict]] = {}
     for annotation in data["probe"]["annotations"]:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
     eligibility_by_image = {int(row["image_id"]): row for row in data["eligibility"]["images"]}
     newly_completed = 0
+    last_checkpoint_count = len(existing)
     for image in data["probe"]["images"]:
         image_id = int(image["id"])
         with Image.open(data["paths"]["images_root"] / image["file_name"]) as opened:
             tensor = image_to_tensor(opened).to(torch.device(device))
         gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(image_id, [])]
         original_row = eligibility_by_image[image_id]
-        for spec in specs:
+        for spec_index, spec in enumerate(specs, start=1):
             key = (spec.canonical_id, int(image["id"]))
             if key in existing:
                 continue
@@ -309,19 +409,53 @@ def run_real(args: argparse.Namespace) -> int:
                     "state_restored": before_digest == after_digest,
                     "rng_restored": True,
                 })
+                existing_by_channel[spec.canonical_id] += 1
             except Exception as error:
                 pair.update({"status": "error", "error_type": type(error).__name__, "error": str(error), "state_restored": False, "rng_restored": False})
+                reporter.pair_error(spec.canonical_id, image_id, error)
             pair_rows[key] = pair
             newly_completed += 1
+            processed_count = len(existing) + newly_completed
+            reporter.pair_processed(
+                processed_count,
+                f"image_id={image_id},channel={spec.canonical_id}",
+            )
+            if (
+                existing_by_channel[spec.canonical_id] == EXPECTED_PROBE_IMAGES
+                and spec.canonical_id not in announced_channels
+            ):
+                announced_channels.add(spec.canonical_id)
+                reporter.channel_done(
+                    spec_index,
+                    len(specs),
+                    spec.canonical_id,
+                    processed_count,
+                )
             if newly_completed % args.checkpoint_every == 0:
+                checkpoint_started_at = time.perf_counter()
                 _write_progress(data, list(pair_rows.values()))
-    _write_progress(data, list(pair_rows.values()))
+                last_checkpoint_count = processed_count
+                reporter.checkpoint(
+                    processed_count,
+                    data["paths"]["output"],
+                    time.perf_counter() - checkpoint_started_at,
+                )
+    processed_count = len(existing) + newly_completed
+    if last_checkpoint_count != processed_count:
+        checkpoint_started_at = time.perf_counter()
+        _write_progress(data, list(pair_rows.values()))
+        reporter.checkpoint(
+            processed_count,
+            data["paths"]["output"],
+            time.perf_counter() - checkpoint_started_at,
+        )
     final = read_e3_artifact(data["paths"]["output"])
     if not final["complete"]:
         raise RuntimeError(f"E3 incomplete: {final['completed_pair_count']}/{final['expected_pair_count']} pairs")
     print("E3_OK")
     print(f"output={data['paths']['output']}")
     print(f"completed_pair_count={final['completed_pair_count']}")
+    print(f"elapsed={_format_duration(time.perf_counter() - run_started_at)}")
     return 0
 
 
