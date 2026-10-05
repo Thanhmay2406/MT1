@@ -15,6 +15,42 @@ class InterventionSpec:
     channel_index: int
 
 
+class ModelStateGuard:
+    """Keep an exact device-local snapshot for cheap per-forward checks."""
+
+    def __init__(self, model: Any):
+        import torch
+
+        self._parameter_names = tuple(name for name, _ in model.named_parameters())
+        self._buffer_names = tuple(name for name, _ in model.named_buffers())
+        self._parameters = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+        self._buffers = {
+            name: buffer.detach().clone()
+            for name, buffer in model.named_buffers()
+        }
+        self._training = {name: module.training for name, module in model.named_modules()}
+        self.digest = model_state_digest(model)
+        self._torch = torch
+
+    def verify(self, model: Any) -> None:
+        parameters = dict(model.named_parameters())
+        buffers = dict(model.named_buffers())
+        if tuple(parameters) != self._parameter_names or tuple(buffers) != self._buffer_names:
+            raise RuntimeError("Model parameter or buffer topology changed during intervention")
+        for name, reference in self._parameters.items():
+            if not self._torch.equal(parameters[name].detach(), reference):
+                raise RuntimeError(f"Model parameter changed during intervention: {name}")
+        for name, reference in self._buffers.items():
+            if not self._torch.equal(buffers[name].detach(), reference):
+                raise RuntimeError(f"Model buffer changed during intervention: {name}")
+        training = {name: module.training for name, module in model.named_modules()}
+        if training != self._training:
+            raise RuntimeError("Model module training flags changed during intervention")
+
+
 def snapshot_rng() -> dict[str, Any]:
     import numpy as np
     import torch
@@ -95,22 +131,29 @@ def post_bn_channel_mask(model: Any, spec: InterventionSpec):
             raise RuntimeError("Intervention hook fired more than once in one forward")
 
 
-def run_intervened_forward(model: Any, image: Any, spec: InterventionSpec) -> Any:
+def run_intervened_forward(model: Any, image: Any, spec: InterventionSpec, state_guard: ModelStateGuard | None = None) -> Any:
     import torch
 
     _assert_eval_mode(model)
-    before_digest = model_state_digest(model)
-    before_training = {name: module.training for name, module in model.named_modules()}
+    if state_guard is None:
+        before_digest = model_state_digest(model)
+        before_training = {name: module.training for name, module in model.named_modules()}
+    else:
+        state_guard.verify(model)
+        before_digest = state_guard.digest
     rng_state = snapshot_rng()
     try:
-        with torch.no_grad(), post_bn_channel_mask(model, spec):
+        with torch.inference_mode(), post_bn_channel_mask(model, spec):
             prediction = model([image])[0]
     finally:
         restore_rng(rng_state)
-    after_training = {name: module.training for name, module in model.named_modules()}
-    after_digest = model_state_digest(model)
-    if before_training != after_training:
-        raise RuntimeError("Model module training flags changed during intervention")
-    if before_digest != after_digest:
-        raise RuntimeError("Model parameters or buffers changed during intervention")
+    if state_guard is None:
+        after_training = {name: module.training for name, module in model.named_modules()}
+        after_digest = model_state_digest(model)
+        if before_training != after_training:
+            raise RuntimeError("Model module training flags changed during intervention")
+        if before_digest != after_digest:
+            raise RuntimeError("Model parameters or buffers changed during intervention")
+    else:
+        state_guard.verify(model)
     return prediction

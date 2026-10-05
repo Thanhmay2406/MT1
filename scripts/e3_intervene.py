@@ -23,7 +23,7 @@ from detector import load_detector_checkpoint
 from identities import discover_structural_groups
 from inference import detection_from_prediction, image_to_tensor
 from integrity import assert_file_sha256, sha256_file
-from intervention import InterventionSpec, model_state_digest, run_intervened_forward
+from intervention import InterventionSpec, ModelStateGuard, run_intervened_forward
 from matching import GroundTruthObject, match_detections_to_gt
 
 EXPECTED_CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=500,
+        help="Persist resumable artifact after this many new pairs (default: 500)",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +121,8 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
     required_files = ("checkpoint", "probe", "eligibility", "importance", "channel_manifest")
     if any(not paths[name].is_file() for name in required_files) or not paths["images_root"].is_dir():
         raise FileNotFoundError("Checkpoint, probe, E1, E2, channel manifest, and images root are required")
+    if args.checkpoint_every < 1:
+        raise ValueError("--checkpoint-every must be positive")
     checkpoint_sha256 = assert_file_sha256(paths["checkpoint"], EXPECTED_CHECKPOINT_SHA256)
     probe_sha256 = assert_file_sha256(paths["probe"], EXPECTED_PROBE_SHA256)
     channel_manifest_sha256 = assert_file_sha256(paths["channel_manifest"], FROZEN_CHANNEL_MANIFEST_SHA256)
@@ -146,6 +154,8 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
         raise ValueError("E2 provenance does not match frozen checkpoint/probe")
     if importance.get("eligibility_sha256") != sha256_file(paths["eligibility"]):
         raise ValueError("E2 eligibility hash does not match supplied E1 artifact")
+    eligibility_sha256 = sha256_file(paths["eligibility"])
+    importance_sha256 = sha256_file(paths["importance"])
     manifest = load_channel_manifest(paths["channel_manifest"])
     validate_channel_manifest(manifest, importance, checkpoint_sha256, probe_sha256)
     return {
@@ -157,6 +167,8 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
         "checkpoint_sha256": checkpoint_sha256,
         "probe_sha256": probe_sha256,
         "channel_manifest_sha256": channel_manifest_sha256,
+        "eligibility_sha256": eligibility_sha256,
+        "importance_sha256": importance_sha256,
         "dataset_manifest_sha256": dataset_manifest_sha256,
         "dataset_manifest": dataset_manifest,
     }
@@ -196,13 +208,25 @@ def _detections_from_output(output: dict, label_to_category_id: dict[int, int]):
     return [detection_from_prediction(output, index, label_to_category_id) for index in range(len(output["boxes"]))]
 
 
+def _ordered_pairs(data: dict, pairs: list[dict]) -> list[dict]:
+    channel_order = {
+        f"{entry['producer_name']}|channel={int(entry['local_channel_index'])}": index
+        for index, entry in enumerate(data["manifest"]["entries"])
+    }
+    image_order = {int(image["id"]): index for index, image in enumerate(data["probe"]["images"])}
+    return sorted(
+        pairs,
+        key=lambda row: (channel_order[row["canonical_id"]], image_order[int(row["image_id"])]),
+    )
+
+
 def _write_progress(data: dict, pairs: list[dict]) -> None:
     manifest = data["manifest"]
     artifact = build_e3_artifact(
         checkpoint_sha256=data["checkpoint_sha256"],
         probe_sha256=data["probe_sha256"],
-        eligibility_sha256=sha256_file(data["paths"]["eligibility"]),
-        importance_sha256=sha256_file(data["paths"]["importance"]),
+        eligibility_sha256=data["eligibility_sha256"],
+        importance_sha256=data["importance_sha256"],
         dataset_manifest_sha256=data["dataset_manifest_sha256"],
         channel_manifest_sha256=data["channel_manifest_sha256"],
         sample_id=manifest["sample_id"],
@@ -210,7 +234,7 @@ def _write_progress(data: dict, pairs: list[dict]) -> None:
         matching_iou_threshold=MATCHING_IOU_THRESHOLD,
         channel_ids=[f"{entry['producer_name']}|channel={int(entry['local_channel_index'])}" for entry in manifest["entries"]],
         image_count=EXPECTED_PROBE_IMAGES,
-        pairs=pairs,
+        pairs=_ordered_pairs(data, pairs),
     )
     write_json_artifact(data["paths"]["output"], artifact)
 
@@ -222,6 +246,7 @@ def run_real(args: argparse.Namespace) -> int:
     data = _validate_inputs(args, require_dataset=True)
     device = resolve_device(args.device)
     model, metadata = load_detector_checkpoint(data["paths"]["checkpoint"], device=device)
+    state_guard = ModelStateGuard(model)
     groups = discover_structural_groups(model)
     group_by_id = {group.group_id: group for group in groups}
     specs = _build_specs(data["manifest"])
@@ -236,8 +261,8 @@ def run_real(args: argparse.Namespace) -> int:
         expected_provenance = {
             "checkpoint_sha256": data["checkpoint_sha256"],
             "probe_sha256": data["probe_sha256"],
-            "eligibility_sha256": sha256_file(data["paths"]["eligibility"]),
-            "importance_sha256": sha256_file(data["paths"]["importance"]),
+            "eligibility_sha256": data["eligibility_sha256"],
+            "importance_sha256": data["importance_sha256"],
             "dataset_manifest_sha256": data["dataset_manifest_sha256"],
             "channel_manifest_sha256": data["channel_manifest_sha256"],
             "sample_id": data["manifest"]["sample_id"],
@@ -253,20 +278,22 @@ def run_real(args: argparse.Namespace) -> int:
     for annotation in data["probe"]["annotations"]:
         annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
     eligibility_by_image = {int(row["image_id"]): row for row in data["eligibility"]["images"]}
-    for spec in specs:
-        for image in data["probe"]["images"]:
+    newly_completed = 0
+    for image in data["probe"]["images"]:
+        image_id = int(image["id"])
+        with Image.open(data["paths"]["images_root"] / image["file_name"]) as opened:
+            tensor = image_to_tensor(opened).to(torch.device(device))
+        gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(image_id, [])]
+        original_row = eligibility_by_image[image_id]
+        for spec in specs:
             key = (spec.canonical_id, int(image["id"]))
             if key in existing:
                 continue
             pair = {"canonical_id": spec.canonical_id, "image_id": int(image["id"]), "file_name": image["file_name"]}
             try:
-                with Image.open(data["paths"]["images_root"] / image["file_name"]) as opened:
-                    tensor = image_to_tensor(opened).to(torch.device(device))
-                gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(int(image["id"]), [])]
-                original_row = eligibility_by_image[int(image["id"])]
-                before_digest = model_state_digest(model)
-                prediction = run_intervened_forward(model, tensor, spec)
-                after_digest = model_state_digest(model)
+                before_digest = state_guard.digest
+                prediction = run_intervened_forward(model, tensor, spec, state_guard=state_guard)
+                after_digest = state_guard.digest
                 detections = _detections_from_output(prediction, metadata["label_to_category_id"])
                 rematches = match_detections_to_gt(gt_objects, detections, MATCHING_IOU_THRESHOLD)
                 object_damage = compute_object_damage(original_row.get("matches", []), rematches)
@@ -285,7 +312,10 @@ def run_real(args: argparse.Namespace) -> int:
             except Exception as error:
                 pair.update({"status": "error", "error_type": type(error).__name__, "error": str(error), "state_restored": False, "rng_restored": False})
             pair_rows[key] = pair
-            _write_progress(data, list(pair_rows.values()))
+            newly_completed += 1
+            if newly_completed % args.checkpoint_every == 0:
+                _write_progress(data, list(pair_rows.values()))
+    _write_progress(data, list(pair_rows.values()))
     final = read_e3_artifact(data["paths"]["output"])
     if not final["complete"]:
         raise RuntimeError(f"E3 incomplete: {final['completed_pair_count']}/{final['expected_pair_count']} pairs")
