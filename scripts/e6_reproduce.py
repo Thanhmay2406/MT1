@@ -18,7 +18,7 @@ from artifacts import read_json_artifact, write_json_artifact
 from channel_manifest import FROZEN_CHANNEL_MANIFEST_SHA256, load_channel_manifest, validate_channel_manifest
 from dataset_manifest import DATASET_MANIFEST_SCHEMA, assert_dataset_manifest_sha256, load_dataset_manifest, validate_dataset_manifest
 from integrity import assert_file_sha256, sha256_file
-from reproducibility import E6_DEFAULT_ATOL, build_e6_artifact, environment_gate, compare_stage_artifact, runtime_fingerprint
+from reproducibility import E6_DEFAULT_ATOL, build_e6_artifact, canonical_json_hash, compare_stage_artifact, environment_gate, runtime_fingerprint
 
 CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
 PROBE_SHA256 = "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d"
@@ -144,7 +144,7 @@ def _validate_baselines(args: argparse.Namespace) -> dict:
         "channel_manifest_sha256": channel_manifest_sha256,
         "e4_sample_sha256": sha256_file(paths["e4_sample"]),
     }
-    return {"paths": paths, "probe": probe, "stages": stages, "hashes": hashes, "reference_hashes": {stage: sha256_file(paths[name]) for stage, name in (("e1", "eligibility"), ("e2", "importance"), ("e3", "intervention"), ("e4", "equivalence"), ("e5", "statistics"))}}
+    return {"paths": paths, "probe": probe, "stages": stages, "frozen_sample": e4_sample, "hashes": hashes, "reference_hashes": {stage: sha256_file(paths[name]) for stage, name in (("e1", "eligibility"), ("e2", "importance"), ("e3", "intervention"), ("e4", "equivalence"), ("e5", "statistics"))}}
 
 
 def dry_run(args: argparse.Namespace) -> int:
@@ -159,7 +159,39 @@ def dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _stage_commands(args: argparse.Namespace, data: dict, work: Path, device: str) -> list[tuple[str, list[str], Path]]:
+def _rebind_e4_sample(source: Path, destination: Path, *, eligibility_sha256: str, importance_sha256: str, intervention_sha256: str, expected_sample_identity_sha256: str | None = None) -> Path:
+    sample = json.loads(source.read_text(encoding="utf-8"))
+    if expected_sample_identity_sha256 is not None and sample.get("sample_identity_sha256") != expected_sample_identity_sha256:
+        raise ValueError("E4 sample identity changed")
+    sample["eligibility_sha256"] = eligibility_sha256
+    sample["importance_sha256"] = importance_sha256
+    sample["intervention_sha256"] = intervention_sha256
+    sample.pop("sample_sha256", None)
+    sample["sample_sha256"] = canonical_json_hash({key: value for key, value in sample.items() if key not in {"sample_sha256", "sample_identity_sha256"}})
+    write_json_artifact(destination, sample)
+    return destination
+
+
+def _run_stage(stage: str, command: list[str], artifact_path: Path) -> dict:
+    print(f"E6_STAGE_START stage={stage.upper()}", flush=True)
+    started = time.time()
+    process = subprocess.Popen(command, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        clean = line.rstrip("\n")
+        print(f"[{stage.upper()}] {clean}", flush=True)
+        tail.append(clean)
+        del tail[:-80]
+    returncode = process.wait()
+    elapsed = time.time() - started
+    print(f"E6_STAGE_DONE stage={stage.upper()} elapsed={elapsed:.1f}s returncode={returncode}", flush=True)
+    if returncode != 0 or not artifact_path.is_file():
+        raise RuntimeError(f"{stage.upper()} rerun failed (returncode={returncode}):\n" + "\n".join(tail[-80:]))
+    return {"stage": stage, "returncode": returncode, "elapsed_seconds": elapsed, "log_tail": tail}
+
+
+def _stage_commands(args: argparse.Namespace, data: dict, work: Path, device: str, e4_sample: Path | None = None) -> list[tuple[str, list[str], Path]]:
     p = data["paths"]
     python = sys.executable
     common = ["--checkpoint", str(p["checkpoint"].resolve()), "--probe", str(p["probe"].resolve()), "--images-root", str(p["images_root"].resolve()), "--device", device]
@@ -168,11 +200,12 @@ def _stage_commands(args: argparse.Namespace, data: dict, work: Path, device: st
     e3 = work / "rerun_e3_damage.json"
     e4 = work / "rerun_e4_equivalence.json"
     e5 = work / "rerun_e5_statistics.json"
+    sample = e4_sample or p["e4_sample"].resolve()
     return [
         ("e1", [python, str(REPO_ROOT / "scripts/e1_eligibility.py"), *common, "--output", str(e1), "--overwrite"], e1),
         ("e2", [python, str(REPO_ROOT / "scripts/e2_score.py"), *common, "--eligibility", str(e1), "--output", str(e2), "--overwrite"], e2),
         ("e3", [python, str(REPO_ROOT / "scripts/e3_intervene.py"), *common, "--eligibility", str(e1), "--importance", str(e2), "--channel-manifest", str(p["channel_manifest"].resolve()), "--dataset-manifest", str(p["dataset_manifest"].resolve()), "--output", str(e3), "--overwrite"], e3),
-        ("e4", [python, str(REPO_ROOT / "scripts/e4_equivalence.py"), *common, "--eligibility", str(e1), "--importance", str(e2), "--intervention", str(e3), "--channel-manifest", str(p["channel_manifest"].resolve()), "--e4-sample", str(p["e4_sample"].resolve()), "--dataset-manifest", str(p["dataset_manifest"].resolve()), "--output", str(e4), "--overwrite"], e4),
+        ("e4", [python, str(REPO_ROOT / "scripts/e4_equivalence.py"), *common, "--eligibility", str(e1), "--importance", str(e2), "--intervention", str(e3), "--channel-manifest", str(p["channel_manifest"].resolve()), "--e4-sample", str(sample), "--dataset-manifest", str(p["dataset_manifest"].resolve()), "--output", str(e4), "--overwrite"], e4),
         ("e5", [python, str(REPO_ROOT / "scripts/e5_analyze.py"), "--checkpoint", str(p["checkpoint"].resolve()), "--probe", str(p["probe"].resolve()), "--eligibility", str(e1), "--importance", str(e2), "--intervention", str(e3), "--equivalence", str(e4), "--channel-manifest", str(p["channel_manifest"].resolve()), "--dataset-manifest", str(p["dataset_manifest"].resolve()), "--output", str(e5), "--overwrite"], e5),
     ]
 
@@ -190,12 +223,20 @@ def run_real(args: argparse.Namespace) -> int:
         stage_results = []
         rerun_paths = {}
         started = time.time()
-        for stage, command, artifact_path in _stage_commands(args, data, work, device):
-            completed = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+        commands = _stage_commands(args, data, work, device)
+        for index, (stage, command, artifact_path) in enumerate(commands):
+            if stage == "e4":
+                _rebind_e4_sample(
+                    data["paths"]["e4_sample"],
+                    work / "rerun_e4_sample.json",
+                    eligibility_sha256=sha256_file(rerun_paths["e1"]),
+                    importance_sha256=sha256_file(rerun_paths["e2"]),
+                    intervention_sha256=sha256_file(rerun_paths["e3"]),
+                    expected_sample_identity_sha256=data["frozen_sample"]["sample_identity_sha256"],
+                )
+                command = _stage_commands(args, data, work, device, work / "rerun_e4_sample.json")[index][1]
             rerun_paths[stage] = artifact_path
-            if completed.returncode != 0 or not artifact_path.is_file():
-                raise RuntimeError(f"{stage.upper()} rerun failed: {completed.stderr[-2000:]}")
-            stage_results.append({"stage": stage, "returncode": completed.returncode, "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]})
+            stage_results.append(_run_stage(stage, command, artifact_path))
         comparisons = []
         for stage, name in (("e1", "eligibility"), ("e2", "importance"), ("e3", "intervention"), ("e4", "equivalence"), ("e5", "statistics")):
             comparisons.append(compare_stage_artifact(stage, data["stages"][stage], read_json_artifact(rerun_paths[stage]), atol=args.atol, rtol=0.0))

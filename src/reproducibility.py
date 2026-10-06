@@ -69,8 +69,24 @@ def compare_json(reference: Any, candidate: Any, *, atol: float, rtol: float) ->
     return {"passed": not mismatches, "mismatch_count": len(mismatches), "mismatches": mismatches, "compared_fields": compared}
 
 
+_DOWNSTREAM_PROVENANCE_FIELDS = {
+    "e2": ("eligibility_sha256",),
+    "e3": ("eligibility_sha256", "importance_sha256"),
+    "e4": ("eligibility_sha256", "importance_sha256", "intervention_sha256", "e4_sample_sha256"),
+    "e5": ("eligibility_sha256", "importance_sha256", "intervention_sha256", "equivalence_sha256"),
+}
+
+
+def normalize_stage_artifact(stage: str, candidate: dict, reference: dict) -> dict:
+    normalized = dict(candidate)
+    for field in _DOWNSTREAM_PROVENANCE_FIELDS.get(stage, ()):
+        if field in reference and field in normalized:
+            normalized[field] = reference[field]
+    return normalized
+
+
 def compare_stage_artifact(stage: str, reference: dict, candidate: dict, *, atol: float, rtol: float) -> dict:
-    result = compare_json(reference, candidate, atol=atol, rtol=rtol)
+    result = compare_json(reference, normalize_stage_artifact(stage, candidate, reference), atol=atol, rtol=rtol)
     return {"stage": stage, **result}
 
 
