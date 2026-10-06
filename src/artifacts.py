@@ -12,6 +12,7 @@ E2_SCHEMA_VERSION = "causal_audit_e2_importance/v1"
 E3_SCHEMA_VERSION = "causal_audit_e3_damage/v1"
 E4_SCHEMA_VERSION = "causal_audit_e4_equivalence/v1"
 E5_SCHEMA_VERSION = "causal_audit_e5_statistics/v1"
+E6_SCHEMA_VERSION = "causal_audit_e6_reproducibility/v1"
 
 
 def write_json_artifact(path: str | Path, payload: Any) -> None:
@@ -284,4 +285,11 @@ def read_e5_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
     if payload.get("schema_version") != E5_SCHEMA_VERSION:
         raise ValueError("Unsupported E5 artifact schema")
+    return payload
+
+
+def read_e6_artifact(path: str | Path) -> dict:
+    payload = read_json_artifact(path)
+    if payload.get("schema_version") != E6_SCHEMA_VERSION:
+        raise ValueError("Unsupported E6 artifact schema")
     return payload
