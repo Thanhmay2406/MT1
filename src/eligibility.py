@@ -6,7 +6,7 @@ from typing import Mapping, Sequence
 from matching import Detection, GroundTruthObject, match_detections_to_gt
 
 
-SCHEMA_VERSION = "causal_audit_e1_eligibility/v1"
+SCHEMA_VERSION = "causal_audit_e1_eligibility/v2"
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,7 @@ class EligibilityArtifact:
     eligible_image_count: int
     eligible_instance_count: int
     images: list[dict]
+    replay: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -30,6 +31,7 @@ class EligibilityArtifact:
             "eligible_image_count": self.eligible_image_count,
             "eligible_instance_count": self.eligible_instance_count,
             "images": self.images,
+            "replay": self.replay,
         }
 
 
@@ -53,6 +55,8 @@ def build_eligibility_artifact(
     checkpoint_sha256: str,
     probe_sha256: str,
     iou_threshold: float = 0.5,
+    raw_outputs: Mapping[int, dict] | None = None,
+    replay: dict | None = None,
 ) -> EligibilityArtifact:
     annotations_by_image = _gt_objects_for_image(probe)
     artifact_images: list[dict] = []
@@ -76,6 +80,8 @@ def build_eligibility_artifact(
                 "height": image.get("height"),
                 "eligible_gt_ids": eligible_gt_ids,
                 "matches": [match.to_dict() for match in matches],
+                "ground_truth": [{"id": gt.id, "category_id": gt.category_id, "bbox": list(gt.bbox)} for gt in gt_objects],
+                "original_output": raw_outputs.get(image_id) if raw_outputs is not None else None,
             }
         )
 
@@ -88,4 +94,5 @@ def build_eligibility_artifact(
         eligible_image_count=eligible_image_count,
         eligible_instance_count=eligible_instance_count,
         images=artifact_images,
+        replay=replay,
     )

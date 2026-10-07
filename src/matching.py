@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations, permutations
 from typing import Sequence
 
 
@@ -81,22 +80,25 @@ def match_detections_to_gt(
             if iou >= iou_threshold:
                 valid_edges[(gt_id, det_index)] = iou
 
-    best_pairs: tuple[tuple[int, int], ...] = ()
-    best_score: tuple[int, float, tuple[tuple[int, int], ...]] | None = None
-    max_size = min(len(gt_ids), len(det_indices))
+    if not valid_edges:
+        return []
+    from munkres import Munkres
 
-    for size in range(max_size + 1):
-        for chosen_gt_ids in combinations(gt_ids, size):
-            for chosen_det_indices in combinations(det_indices, size):
-                for det_order in permutations(chosen_det_indices):
-                    pairs = tuple(sorted(zip(chosen_gt_ids, det_order)))
-                    if any(pair not in valid_edges for pair in pairs):
-                        continue
-                    total_iou = sum(valid_edges[pair] for pair in pairs)
-                    score = (size, total_iou, tuple((-gt, -pred) for gt, pred in pairs))
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_pairs = pairs
+    # Binary floats have power-of-two denominators. Integer objectives avoid
+    # epsilon perturbations that could change cardinality or the IoU optimum.
+    edges = sorted(valid_edges)
+    ratios = {edge: valid_edges[edge].as_integer_ratio() for edge in edges}
+    denominator = max(d for _, d in ratios.values())
+    lex_scale = 1 << len(edges)
+    cardinality_scale = (min(len(gt_ids), len(det_indices)) * denominator + 1) * lex_scale
+    profits = {edge: cardinality_scale + n * (denominator // d) * lex_scale + (1 << (len(edges) - k - 1))
+               for k, edge in enumerate(edges) for n, d in [ratios[edge]]}
+    # Explicit dummy columns permit every GT to remain unmatched.
+    costs = [[-profits.get((gt, pred), -cardinality_scale) for pred in det_indices]
+             + [0] * len(gt_ids) for gt in gt_ids]
+    assigned = Munkres().compute(costs)
+    best_pairs = sorted((gt_ids[i], det_indices[j]) for i, j in assigned
+                        if i < len(gt_ids) and j < len(det_indices) and (gt_ids[i], det_indices[j]) in valid_edges)
 
     records: list[MatchRecord] = []
     for gt_id, det_index in best_pairs:
@@ -114,4 +116,15 @@ def match_detections_to_gt(
                 iou=valid_edges[(gt_id, det_index)],
             )
         )
+    return records
+
+
+def legacy_independent_matches(gt_objects, detections, iou_threshold=.5):
+    """Diagnostic only: best valid IoU per GT, allowing prediction reuse."""
+    records = []
+    for gt in sorted(gt_objects, key=lambda g: g.id):
+        valid = [(bbox_iou_xywh(gt.bbox, d.bbox), d) for d in detections if d.category_id == gt.category_id and bbox_iou_xywh(gt.bbox, d.bbox) >= iou_threshold]
+        if valid:
+            iou, d = max(valid, key=lambda item: (item[0], -item[1].index))
+            records.append(MatchRecord(gt.id, gt.category_id, list(gt.bbox), d.index, d.category_id, list(d.bbox), float(d.score), iou))
     return records

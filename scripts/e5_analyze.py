@@ -22,10 +22,10 @@ from statistics import METHODS, group_statistics, macro_average, paired_macro_di
 CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
 PROBE_SHA256 = "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d"
 DATASET_MANIFEST_SHA256 = "fce7c5bc78d606c641873220f124d4656f1c32d96c7ca1e2dbc7b0b4d4f6536f"
-E1_SCHEMA = "causal_audit_e1_eligibility/v1"
-E2_SCHEMA = "causal_audit_e2_importance/v1"
-E3_SCHEMA = "causal_audit_e3_damage/v1"
-E4_SCHEMA = "causal_audit_e4_equivalence/v1"
+E1_SCHEMA = "causal_audit_e1_eligibility/v2"
+E2_SCHEMA = "causal_audit_e2_importance/v2"
+E3_SCHEMA = "causal_audit_e3_damage/v2"
+E4_SCHEMA = "causal_audit_e4_equivalence/v2"
 EXPECTED_IMAGES = 300
 EXPECTED_ANNOTATIONS = 372
 MATCHING_IOU_THRESHOLD = 0.5
@@ -99,7 +99,7 @@ def _preflight(args: argparse.Namespace) -> dict:
     dataset_manifest = load_dataset_manifest(paths["dataset_manifest"])
     if dataset_manifest.get("schema_version") != DATASET_MANIFEST_SCHEMA:
         raise ValueError("Unsupported dataset manifest schema")
-    validate_dataset_manifest(dataset_manifest, paths["dataset_manifest"].parent, probe, probe_path=paths["probe"])
+    dataset_verification = validate_dataset_manifest(dataset_manifest, paths["dataset_manifest"].parent, probe, probe_path=paths["probe"])
     e1 = read_json_artifact(paths["eligibility"])
     _validate_e1(e1, probe, checkpoint_sha256, probe_sha256)
     e1_sha256 = sha256_file(paths["eligibility"])
@@ -120,7 +120,7 @@ def _preflight(args: argparse.Namespace) -> dict:
     _validate_e4(e4, e3_sha256)
     if e4.get("checkpoint_sha256") != checkpoint_sha256 or e4.get("probe_sha256") != probe_sha256 or e4.get("dataset_manifest_sha256") != dataset_manifest_sha256 or e4.get("channel_manifest_sha256") != channel_manifest_sha256:
         raise ValueError("E4 frozen-input provenance mismatch")
-    return {"paths": paths, "probe": probe, "e1": e1, "e2": e2, "e3": e3, "e4": e4, "e3_pairs": e3_pairs, "hashes": {"checkpoint_sha256": checkpoint_sha256, "probe_sha256": probe_sha256, "eligibility_sha256": e1_sha256, "importance_sha256": e2_sha256, "intervention_sha256": e3_sha256, "equivalence_sha256": e4_sha256, "dataset_manifest_sha256": dataset_manifest_sha256, "channel_manifest_sha256": channel_manifest_sha256}, "channel_ids": channel_ids}
+    return {"dataset_verification": dataset_verification, "paths": paths, "probe": probe, "e1": e1, "e2": e2, "e3": e3, "e4": e4, "e3_pairs": e3_pairs, "hashes": {"checkpoint_sha256": checkpoint_sha256, "probe_sha256": probe_sha256, "eligibility_sha256": e1_sha256, "importance_sha256": e2_sha256, "intervention_sha256": e3_sha256, "equivalence_sha256": e4_sha256, "dataset_manifest_sha256": dataset_manifest_sha256, "channel_manifest_sha256": channel_manifest_sha256}, "channel_ids": channel_ids}
 
 
 def _build_channel_rows(data: dict) -> tuple[list[dict], list[int]]:
@@ -132,6 +132,9 @@ def _build_channel_rows(data: dict) -> tuple[list[dict], list[int]]:
         e2_row = e2_by_id.get(canonical_id)
         if e2_row is None:
             raise ValueError(f"E2 channel missing: {canonical_id}")
+        contributions = e2_row.get("importance_by_image")
+        if not contributions or set(contributions) != {str(i) for i in eligible_image_ids}:
+            raise ValueError("E2 lacks complete per-image importance; historical aggregates cannot be bootstrapped")
         damage_by_image = {}
         for image_id in eligible_image_ids:
             pair = data["e3_pairs"][(canonical_id, image_id)]
@@ -144,7 +147,7 @@ def _build_channel_rows(data: dict) -> tuple[list[dict], list[int]]:
             if not math.isclose(damage, float(pair["image_damage"]), rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"E3 image damage aggregation mismatch: {canonical_id}, {image_id}")
             damage_by_image[str(image_id)] = damage
-        rows.append({"canonical_id": canonical_id, "group_id": e2_row["group_id"], "stage": e2_row["stage"], "block": e2_row["block"], "hidden_conv": e2_row["hidden_conv"], "scores": e2_row["scores"], "damage_by_image": damage_by_image, "damage": sum(damage_by_image.values()) / len(damage_by_image), "eligible_image_count": len(damage_by_image)})
+        rows.append({"canonical_id": canonical_id, "group_id": e2_row["group_id"], "stage": e2_row["stage"], "block": e2_row["block"], "hidden_conv": e2_row["hidden_conv"], "scores": e2_row["scores"], "importance_by_image": contributions, "damage_by_image": damage_by_image, "damage": sum(damage_by_image.values()) / len(damage_by_image), "eligible_image_count": len(damage_by_image)})
     return rows, eligible_image_ids
 
 
@@ -158,6 +161,17 @@ def _analyze(data: dict, bootstrap_replicates: int, permutation_replicates: int)
     permutation = permutation_tests(channel_rows, replicates=permutation_replicates, seed=PERMUTATION_SEED)
     for hypothesis, baseline in (("H2", "l1"), ("H3", "taylor"), ("H4", "activation")):
         hypotheses[hypothesis]["permutation"] = permutation["statistics"][baseline]
+        hypotheses[hypothesis]["partial_rank"] = partial_rank_macro(channel_rows, baseline)
+        hypotheses[hypothesis]["confidence_interval"] = bootstrap["partial_rank"][baseline]
+        hypotheses[hypothesis]["supported"] = False
+        hypotheses[hypothesis]["statistical_rejection"] = (permutation["statistics"][baseline]["reject"]
+            and hypotheses[hypothesis]["observed"] is not None and hypotheses[hypothesis]["observed"] > 0)
+        hypotheses[hypothesis]["support_status"] = "requires_protocol_compliance_review" if permutation["family_status"] == "complete" else "inference_unavailable"
+    for method in METHODS:
+        macro_stats[method]["spearman"]["confidence_interval"] = bootstrap["statistics"][method]
+        macro_stats[method]["kendall"]["confidence_interval"] = bootstrap["kendall"][method]
+    for method in paired:
+        paired[method]["confidence_interval"] = bootstrap["paired_differences"][method]
     return {"channel_rows": channel_rows, "group_statistics": group_stats, "macro_statistics": macro_stats, "paired_differences": paired, "hypotheses": hypotheses, "bootstrap": bootstrap, "permutation": permutation}
 
 
@@ -177,6 +191,13 @@ def run_real(args: argparse.Namespace) -> int:
     data = _preflight(args)
     analysis = _analyze(data, args.bootstrap_replicates, args.permutation_replicates)
     artifact = build_e5_artifact(**data["hashes"], equivalence_status=data["e4"]["equivalence_status"], matching_iou_threshold=MATCHING_IOU_THRESHOLD, eligible_image_count=data["e2"]["eligible_image_count"], eligible_instance_count=data["e2"]["eligible_instance_count"], **analysis)
+    artifact["dataset_verification"] = data["dataset_verification"]
+    artifact["diagnostics"] = _diagnostic_statistics(data, analysis["channel_rows"])
+    intervals = [*analysis["bootstrap"]["statistics"].values(), *analysis["bootstrap"]["kendall"].values(),
+                 *analysis["bootstrap"]["paired_differences"].values(), *analysis["bootstrap"]["partial_rank"].values()]
+    artifact["inference_complete"] = all(ci["status"] == "ok" for ci in intervals) and analysis["permutation"]["family_status"] == "complete"
+    artifact["scientific_completion"] = False
+    artifact["protocol_compliance"] = "requires_recorded_clarifications_and_provenance_review"
     write_json_artifact(data["paths"]["output"], artifact)
     print("E5_OK")
     print(f"output={data['paths']['output']}")
@@ -185,6 +206,33 @@ def run_real(args: argparse.Namespace) -> int:
     print(f"bootstrap_replicates={args.bootstrap_replicates}")
     print(f"permutation_replicates={args.permutation_replicates}")
     return 0
+
+
+def _diagnostic_statistics(data, rows):
+    from statistics import spearman_tie_aware
+    results = {}
+    for row in rows:
+        ids = list(row["damage_by_image"])
+        pairs = [data["e3_pairs"][(row["canonical_id"], int(i))] for i in ids]
+        diagnostic_values = {}
+        for name in ("localization", "loss"):
+            if name == "loss":
+                values = [p["diagnostics"]["loss"]["total_delta"] for p in pairs]
+            else:
+                values = [sum(v["localization_damage"] for v in p["diagnostics"]["localization"]) / len(p["diagnostics"]["localization"]) for p in pairs]
+            diagnostic_values[name + "_vs_confidence_damage"] = spearman_tie_aware(values, [row["damage_by_image"][i] for i in ids]) if len(ids) >= 2 else {"value": None, "status": "not_identifiable"}
+        diagnostic_values["legacy_matching_image_damage"] = {
+            i: sum(v["damage"] for v in p["diagnostics"]["legacy_matching"]["object_damage"]) / len(p["diagnostics"]["legacy_matching"]["object_damage"])
+            if p["diagnostics"]["legacy_matching"]["object_damage"] else None for i, p in zip(ids, pairs)}
+        results[row["canonical_id"]] = diagnostic_values
+    groups = group_statistics(rows)
+    summaries = {}
+    for field in ("stage", "hidden_conv"):
+        for value in sorted({g[field] for g in groups.values()}):
+            subset = {name: g for name, g in groups.items() if g[field] == value}
+            summaries[f"{field}={value}"] = {m: {s: macro_average(subset, s, m) for s in ("spearman", "kendall")} for m in METHODS}
+    return {"scope": "eligible_images", "channels": results, "stage_hidden_conv_summaries": summaries, "full_diagnostic_completion": False,
+            "class_flip": {"value": None, "status": "not_identifiable", "reason": "cross_forward_detection_identity_not_defined"}}
 
 
 def main() -> int:

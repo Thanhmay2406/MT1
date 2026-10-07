@@ -127,6 +127,8 @@ def _resolve_device(requested: str) -> str:
 
 
 def run_real(args: argparse.Namespace) -> int:
+    from determinism import configure_determinism
+    configure_determinism()
     if not args.output:
         raise ValueError("--output is required unless --dry-run is used")
 
@@ -153,23 +155,30 @@ def run_real(args: argparse.Namespace) -> int:
     from artifacts import write_json_artifact
     from detector import load_detector_checkpoint
     from eligibility import build_eligibility_artifact
-    from inference import predict_probe
+    from inference import predict_probe, replay_metadata
 
     model, metadata = load_detector_checkpoint(checkpoint, device=device)
+    raw_outputs = {}
+    replay = replay_metadata(model, repo_root=REPO_ROOT, device=device)
     predictions = predict_probe(
         model,
         probe,
         images_root,
         device=device,
         label_to_category_id=metadata["label_to_category_id"],
+        raw_outputs=raw_outputs,
     )
     artifact = build_eligibility_artifact(
         probe,
         predictions,
         checkpoint_sha256=checkpoint_sha256,
         probe_sha256=probe_sha256,
+        raw_outputs=raw_outputs,
+        replay=replay,
     )
-    write_json_artifact(output, artifact)
+    payload = artifact.to_dict()
+    payload["forward_counts"] = {"original_eval": artifact.image_count}
+    write_json_artifact(output, payload)
     print("E1_OK")
     print(f"device={device}")
     print(f"output={output}")

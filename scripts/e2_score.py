@@ -12,12 +12,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from artifacts import build_e2_artifact, percentile_ranks_by_group, read_json_artifact, write_json_artifact
+from determinism import DETERMINISTIC_SEED, configure_determinism, determinism_metadata
 from integrity import assert_file_sha256, sha256_file
 
 
 EXPECTED_CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
 EXPECTED_PROBE_SHA256 = "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d"
-EXPECTED_E1_SCHEMA = "causal_audit_e1_eligibility/v1"
+EXPECTED_E1_SCHEMA = "causal_audit_e1_eligibility/v2"
 EXPECTED_PROBE_IMAGES = 300
 EXPECTED_PROBE_ANNOTATIONS = 372
 EXPECTED_CATEGORIES = [0, 1, 2, 3, 4, 5]
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eligibility", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--seed", type=int, default=DETERMINISTIC_SEED)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -124,29 +126,8 @@ def resolve_device(requested: str) -> str:
 
 
 def _target_for_image(probe: dict, image_id: int, device: str, category_id_to_label):
-    import torch
-
-    annotations = [annotation for annotation in probe["annotations"] if annotation["image_id"] == image_id]
-    boxes = []
-    labels = []
-    areas = []
-    for annotation in annotations:
-        x, y, width, height = [float(value) for value in annotation["bbox"]]
-        if width <= 0 or height <= 0:
-            continue
-        boxes.append([x, y, x + width, y + height])
-        category_id = int(annotation["category_id"])
-        if category_id not in category_id_to_label:
-            raise ValueError(f"Unknown COCO category ID in probe: {category_id}")
-        labels.append(int(category_id_to_label[category_id]))
-        areas.append(width * height)
-    return {
-        "boxes": torch.tensor(boxes, dtype=torch.float32, device=device).reshape(-1, 4),
-        "labels": torch.tensor(labels, dtype=torch.int64, device=device),
-        "image_id": torch.tensor([image_id], dtype=torch.int64, device=device),
-        "area": torch.tensor(areas, dtype=torch.float32, device=device),
-        "iscrowd": torch.zeros(len(boxes), dtype=torch.int64, device=device),
-    }
+    from inference import target_for_image
+    return target_for_image(probe, image_id, device, category_id_to_label)
 
 
 def _snapshot_rng():
@@ -195,8 +176,8 @@ def _detections_from_output(output, label_to_category_id):
 
 
 def _check_match_identity(current_matches, frozen_row):
-    expected = [match["gt_id"] for match in frozen_row["matches"]]
-    actual = [match.gt_id for match in current_matches]
+    expected = frozen_row["matches"]
+    actual = [match.to_dict() for match in current_matches]
     if actual != expected:
         raise RuntimeError(f"E1 match identity changed for image {frozen_row['image_id']}")
 
@@ -209,6 +190,8 @@ def compute_scores(model, probe, eligibility, groups, images_root, device, label
     from baselines import activation_channel_scores, l1_channel_scores, taylor_channel_scores
     from hooks import PostBNHookBank
     from matching import GroundTruthObject, match_detections_to_gt
+    from inference import assert_original_replay
+    from intervention import loss_scoring_context, validate_loss_components
 
     annotations_by_image = {}
     for annotation in probe["annotations"]:
@@ -234,10 +217,14 @@ def compute_scores(model, probe, eligibility, groups, images_root, device, label
             GroundTruthObject(int(annotation["id"]), int(annotation["category_id"]), annotation["bbox"])
             for annotation in annotations_by_image.get(image_id, [])
         ]
+        expected_gt = [{"id": g.id, "category_id": g.category_id, "bbox": list(g.bbox)} for g in gt_objects]
+        if row.get("ground_truth") != expected_gt or row.get("original_output") is None:
+            raise RuntimeError("E1 lacks exact original replay evidence")
         model.eval()
         with PostBNHookBank(model, norm_names) as bank:
             model.zero_grad(set_to_none=True)
             output = model([image])[0]
+            assert_original_replay(output, row["original_output"])
             detections = _detections_from_output(output, label_to_category_id)
             current_matches = match_detections_to_gt(
                 gt_objects,
@@ -263,32 +250,32 @@ def compute_scores(model, probe, eligibility, groups, images_root, device, label
                     )
             for group in groups:
                 group_scores = per_group_objects[group.group_id]
-                gxa_images[group.group_id].append(torch.stack(group_scores).mean(dim=0))
+                gxa_images[group.group_id].append(torch.stack(group_scores).double().mean(dim=0))
 
-        model.train()
-        _set_batchnorm_eval(model)
         rng_state = _snapshot_rng()
         try:
-            target = _target_for_image(probe, image_id, device, category_id_to_label)
-            model.zero_grad(set_to_none=True)
-            losses = model([image], [target])
-            loss = sum(losses.values())
-            loss.backward()
-            for group in groups:
-                if group.producer_module.weight.grad is None:
-                    raise RuntimeError(f"Missing Taylor gradient for {group.producer_name}")
-                taylor_images[group.group_id].append(
-                    taylor_channel_scores(group.producer_module.weight.detach(), group.producer_module.weight.grad.detach()).cpu()
-                )
+            with loss_scoring_context(model, allow_gradient_updates=True):
+                target = _target_for_image(probe, image_id, device, category_id_to_label)
+                model.zero_grad(set_to_none=True)
+                losses = model([image], [target])
+                validate_loss_components(losses)
+                loss = sum(losses.values())
+                loss.backward()
+                for group in groups:
+                    if group.producer_module.weight.grad is None:
+                        raise RuntimeError(f"Missing Taylor gradient for {group.producer_name}")
+                    taylor_images[group.group_id].append(
+                        taylor_channel_scores(group.producer_module.weight.detach(), group.producer_module.weight.grad.detach()).cpu()
+                    )
         finally:
             _restore_rng(rng_state)
             model.eval()
 
     rows = []
     for group in groups:
-        gxa = torch.stack(gxa_images[group.group_id]).mean(dim=0)
-        activation = torch.stack(activation_images[group.group_id]).mean(dim=0)
-        taylor = torch.stack(taylor_images[group.group_id]).mean(dim=0)
+        gxa = torch.stack(gxa_images[group.group_id]).double().mean(dim=0)
+        activation = torch.stack(activation_images[group.group_id]).double().mean(dim=0)
+        taylor = torch.stack(taylor_images[group.group_id]).double().mean(dim=0)
         method_vectors = {"gxa": gxa, "activation": activation, "l1": l1_scores[group.group_id], "taylor": taylor}
         for identity in group.channels_identities:
             index = identity.local_channel_index
@@ -300,6 +287,11 @@ def compute_scores(model, probe, eligibility, groups, images_root, device, label
                 "hidden_conv": identity.hidden_conv,
                 "local_channel_index": index,
                 "scores": {method: {"raw": float(vector[index].item())} for method, vector in method_vectors.items()},
+                "importance_by_image": {str(row["image_id"]): {
+                    "gxa": float(gxa_images[group.group_id][i][index]),
+                    "activation": float(activation_images[group.group_id][i][index]),
+                    "taylor": float(taylor_images[group.group_id][i][index]),
+                } for i, row in enumerate(eligible_rows)},
             })
     for method in ("gxa", "activation", "l1", "taylor"):
         ranked = percentile_ranks_by_group([
@@ -333,10 +325,12 @@ def dry_run(args: argparse.Namespace) -> int:
     print(f"eligible_images={eligibility['eligible_image_count']}")
     print(f"eligible_instances={eligibility['eligible_instance_count']}")
     print(f"eligibility_sha256={sha256_file(eligibility_path)}")
+    print(f"seed={args.seed}")
     return 0
 
 
 def run_real(args: argparse.Namespace) -> int:
+    configure_determinism(args.seed)
     from detector import load_detector_checkpoint
     from identities import discover_structural_groups
 
@@ -355,7 +349,10 @@ def run_real(args: argparse.Namespace) -> int:
     eligibility = read_json_artifact(eligibility_path)
     validate_eligibility(eligibility, probe, checkpoint_sha256, probe_sha256)
     device = resolve_device(args.device)
+    determinism = determinism_metadata(args.seed, device=device)
     model, metadata = load_detector_checkpoint(checkpoint, device=device)
+    from inference import assert_replay_metadata
+    assert_replay_metadata(model, eligibility.get("replay"), repo_root=REPO_ROOT, device=device)
     groups = discover_structural_groups(model)
     channels = compute_scores(
         model,
@@ -390,7 +387,11 @@ def run_real(args: argparse.Namespace) -> int:
         image_count=eligibility["image_count"],
         eligible_image_count=eligibility["eligible_image_count"],
         eligible_instance_count=eligibility["eligible_instance_count"],
+        determinism=determinism,
     )
+    artifact["aggregation_dtype"] = "float64_equal_image_mean"
+    artifact["forward_counts"] = {"gxa_original": eligibility["eligible_image_count"], "taylor_loss": eligibility["eligible_image_count"],
+                                  "gxa_backward_targets": eligibility["eligible_instance_count"]}
     write_json_artifact(output, artifact)
     print("E2_OK")
     print(f"device={device}")

@@ -24,7 +24,9 @@ def main() -> int:
     print(f"output={args.output}")
     print(f"manifest_sha256={manifest['manifest_sha256']}")
     print(f"train_images={manifest['splits']['train']['image_count']}")
-    print(f"valid_images={manifest['splits']['valid']['image_count']}")
+    print("valid=not_verified_access_prohibited")
+    print("test=not_verified_access_prohibited")
+    print("full_package_byte_verification=False")
     print(f"probe_images={manifest['probe_reference']['image_count']}")
     return 0
 

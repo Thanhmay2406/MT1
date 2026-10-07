@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 
-E4_SAMPLE_SCHEMA = "causal_audit_e4_equivalence_sample/v1"
+E4_SAMPLE_SCHEMA = "causal_audit_e4_equivalence_sample/v2"
 E4_TOLERANCE = 1e-5
 
 
@@ -204,6 +204,8 @@ def compare_mask_and_physical(mask_damage: Sequence[dict], physical_damage: Sequ
             "damage_abs_difference": damage_difference,
         })
     return {
+        "comparison_scope": "utility_damage_diagnostic_only",
+        "full_endpoint_verification": False,
         "object_comparisons": comparisons,
         "max_utility_abs_difference": max_utility_difference,
         "max_damage_abs_difference": max_damage_difference,
@@ -215,3 +217,85 @@ def compare_mask_and_physical(mask_damage: Sequence[dict], physical_damage: Sequ
 def canonical_json_hash(payload: dict) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def select_e4_sample(entries: Sequence[dict], probe: dict):
+    strata = {}
+    for entry in entries:
+        kind = entry.get("hidden_conv") or {"bottleneck_conv1_hidden": "conv1", "bottleneck_conv2_hidden": "conv2"}.get(entry.get("group_kind"))
+        strata.setdefault((entry["stage"], kind), []).append(entry)
+    if len(strata) != 8 or len({s for s, _ in strata}) != 4 or {c for _, c in strata} != {"conv1", "conv2"}:
+        raise ValueError("E4 requires four stages times two hidden-convolution strata")
+    if len(probe["images"]) < 16:
+        raise ValueError("E4 requires at least 16 probe entries")
+    chosen = [min(strata[key], key=lambda entry: hashlib.sha256(entry["canonical_channel_id"].encode("utf-8")).hexdigest()) for key in sorted(strata)]
+    return chosen, probe["images"][:16]
+
+
+def compare_equivalence_endpoints(mask_consumer, physical_consumer, mask_output, physical_output, mask_matches, physical_matches, keep_indices):
+    import torch
+    from inference import serialize_prediction
+
+    # PyTorch 2.10 default float32 rule, explicit even on another test runtime.
+    rtol, atol = 1.3e-6, 1e-5
+    errors = {}
+    def close(name, a, b):
+        try:
+            if a.dtype != torch.float32 or b.dtype != torch.float32:
+                raise AssertionError("Continuous endpoints must be float32")
+            if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+                raise AssertionError("Non-finite endpoint")
+            torch.testing.assert_close(a, b, rtol=rtol, atol=atol)
+            return True
+        except AssertionError as error:
+            errors[name] = str(error)
+            return False
+    consumer = close("consumer", mask_consumer, physical_consumer)
+    boxes = close("boxes", mask_output["boxes"], physical_output["boxes"])
+    scores = close("scores", mask_output["scores"], physical_output["scores"])
+    def identities(matches):
+        return [(int(m["gt_id"]), int(m["gt_category_id"]), int(m["prediction_index"]), int(m["prediction_category_id"])) for m in matches]
+    discrete = (mask_output["labels"].dtype == physical_output["labels"].dtype == torch.int64
+                and torch.equal(mask_output["labels"], physical_output["labels"])
+                and identities(mask_matches) == identities(physical_matches))
+    def tensor_identity(value):
+        t = value.detach().cpu().contiguous()
+        return {"shape": list(t.shape), "dtype": str(t.dtype), "sha256": hashlib.sha256(t.numpy().tobytes()).hexdigest()}
+    return {"equivalent": consumer and boxes and scores and discrete,
+            "full_endpoint_verification": True,
+            "comparison_scope": "consumer_final_output_and_matching",
+            "consumer_equivalent": consumer, "final_continuous_equivalent": boxes and scores,
+            "discrete_equivalent": discrete, "endpoint_errors": errors,
+            "closeness_rule": {"reference": "torch_2.10_default_float32", "rtol": rtol, "atol": atol},
+            "keep_indices": list(keep_indices), "mask_consumer": tensor_identity(mask_consumer),
+            "physical_consumer": tensor_identity(physical_consumer),
+            "mask_output": serialize_prediction(mask_output), "physical_output": serialize_prediction(physical_output)}
+
+
+def capture_consumer_forward(model, image, consumer_name, spec=None):
+    import torch
+    from intervention import ModelStateGuard, snapshot_rng, restore_rng, rng_states_equal, post_bn_channel_mask, _assert_eval_mode
+    from contextlib import nullcontext
+    _assert_eval_mode(model)
+    guard = ModelStateGuard(model)
+    rng = snapshot_rng()
+    captured = []
+    def capture(_module, _inputs, output):
+        captured.append(output.detach().clone())
+    handle = dict(model.named_modules())[consumer_name].register_forward_hook(capture)
+    try:
+        with torch.inference_mode(), post_bn_channel_mask(model, spec) if spec else nullcontext():
+            output = model([image])[0]
+    finally:
+        handle.remove()
+        restore_rng(rng)
+        try:
+            guard.verify(model)
+        except RuntimeError:
+            guard.restore(model)
+            raise
+        if not rng_states_equal(rng, snapshot_rng()):
+            raise RuntimeError("Equivalence RNG restoration failed")
+    if len(captured) != 1:
+        raise RuntimeError("Consumer must execute exactly once")
+    return output, captured[0]

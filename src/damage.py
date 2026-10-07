@@ -47,3 +47,18 @@ def aggregate_channel_damage(image_damages: Sequence[float]) -> float:
     if not image_damages:
         raise ValueError("Cannot aggregate an empty channel damage set")
     return sum(float(value) for value in image_damages) / len(image_damages)
+
+
+def correspondence_diagnostics(original_matches, intervened_matches):
+    original = {int(_match_value(m, "gt_id")): m for m in original_matches}
+    intervened = {int(_match_value(m, "gt_id")): m for m in intervened_matches}
+    count = sum(gt not in intervened for gt in original)
+    localization = [{"gt_id": gt, "original_iou": float(_match_value(m, "iou")),
+                     "intervened_iou": float(_match_value(intervened[gt], "iou")) if gt in intervened else 0.,
+                     "localization_damage": float(_match_value(m, "iou")) - (float(_match_value(intervened[gt], "iou")) if gt in intervened else 0.)}
+                    for gt, m in original.items()]
+    return {"class_flip": {"value": None, "status": "not_identifiable",
+                           "reason": "cross_forward_detection_identity_not_defined", "scope": "originally_eligible_gt", "primary_damage_unchanged": True},
+            "same_class_match_failure_count": count, "evaluated_originally_eligible_count": len(original),
+            "same_class_match_failure_rate": count / len(original) if original else None,
+            "localization": localization, "full_diagnostic_completion": False}

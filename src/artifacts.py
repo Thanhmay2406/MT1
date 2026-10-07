@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import Any
 
 
-E2_SCHEMA_VERSION = "causal_audit_e2_importance/v1"
-E3_SCHEMA_VERSION = "causal_audit_e3_damage/v1"
-E4_SCHEMA_VERSION = "causal_audit_e4_equivalence/v1"
-E5_SCHEMA_VERSION = "causal_audit_e5_statistics/v1"
-E6_SCHEMA_VERSION = "causal_audit_e6_reproducibility/v1"
+E2_SCHEMA_VERSION = "causal_audit_e2_importance/v2"
+E3_SCHEMA_VERSION = "causal_audit_e3_damage/v2"
+E4_SCHEMA_VERSION = "causal_audit_e4_equivalence/v2"
+E5_SCHEMA_VERSION = "causal_audit_e5_statistics/v2"
+E6_SCHEMA_VERSION = "causal_audit_e6_reproducibility/v2"
+E7_SCHEMA_VERSION = "causal_audit_e7_final_report/v1"
 
 
 def write_json_artifact(path: str | Path, payload: Any) -> None:
@@ -54,6 +55,21 @@ def percentile_ranks_by_group(rows: list[dict]) -> list[dict]:
     return output
 
 
+def validate_e2_contributions(channels, eligible_image_count):
+    image_ids = None
+    for row in channels:
+        contributions = row.get("importance_by_image")
+        if not isinstance(contributions, dict) or len(contributions) != eligible_image_count:
+            raise ValueError("E2 requires complete per-image importance contributions")
+        if image_ids is None:
+            image_ids = set(contributions)
+        if set(contributions) != image_ids:
+            raise ValueError("E2 channels must share the same eligible image domain")
+        for values in contributions.values():
+            if set(values) != {"gxa", "activation", "taylor"} or not all(math.isfinite(float(v)) for v in values.values()):
+                raise ValueError("E2 per-image contributions must contain three finite methods")
+
+
 def build_e2_artifact(
     *,
     checkpoint_sha256: str,
@@ -65,6 +81,7 @@ def build_e2_artifact(
     image_count: int,
     eligible_image_count: int,
     eligible_instance_count: int,
+    determinism: dict | None = None,
 ) -> dict:
     if len(channels) != sum(int(group["channels"]) for group in groups):
         raise ValueError("Channel rows do not match structural group widths")
@@ -80,7 +97,8 @@ def build_e2_artifact(
                 value = float(row["scores"][method][key])
                 if value != value or value in (float("inf"), float("-inf")):
                     raise ValueError("E2 scores must be finite")
-    return {
+    validate_e2_contributions(channels, eligible_image_count)
+    artifact = {
         "schema_version": E2_SCHEMA_VERSION,
         "checkpoint_sha256": checkpoint_sha256,
         "probe_sha256": probe_sha256,
@@ -94,12 +112,18 @@ def build_e2_artifact(
         "groups": groups,
         "channels": channels,
     }
+    if determinism is not None:
+        artifact["determinism"] = determinism
+    artifact["implementation_contract"] = "mt1_clarifications_implementation_guide:Q01-Q05"
+    return artifact
 
 
 def read_e2_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
-    if payload.get("schema_version") != E2_SCHEMA_VERSION:
+    if payload.get("schema_version") not in (E2_SCHEMA_VERSION, E2_SCHEMA_VERSION.replace("/v2", "/v1")):
         raise ValueError("Unsupported E2 artifact schema")
+    if payload["schema_version"] == E2_SCHEMA_VERSION:
+        validate_e2_contributions(payload["channels"], payload["eligible_image_count"])
     return payload
 
 
@@ -150,7 +174,7 @@ def build_e3_artifact(
 
 def read_e3_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
-    if payload.get("schema_version") != E3_SCHEMA_VERSION:
+    if payload.get("schema_version") not in (E3_SCHEMA_VERSION, E3_SCHEMA_VERSION.replace("/v2", "/v1")):
         raise ValueError("Unsupported E3 artifact schema")
     return payload
 
@@ -171,6 +195,7 @@ def build_e4_artifact(
     channel_ids: list[str],
     image_ids: list[int],
     pairs: list[dict],
+    dataset_verification: dict | None = None,
 ) -> dict:
     expected_pair_count = len(channel_ids) * len(image_ids)
     keys = [(row.get("canonical_id"), int(row.get("image_id"))) for row in pairs]
@@ -181,6 +206,10 @@ def build_e4_artifact(
     if any(channel not in set(channel_ids) for channel, _ in keys) or any(image not in set(image_ids) for _, image in keys):
         raise ValueError("E4 pair references an undeclared sample identity")
     for row in pairs:
+        if row.get("status") != "ok":
+            continue
+        if row.get("full_endpoint_verification") is not True:
+            raise ValueError("E4 v2 requires full endpoint verification, not utility-only comparisons")
         for field in ("max_utility_abs_difference", "max_damage_abs_difference"):
             value = float(row.get(field, float("nan")))
             if not math.isfinite(value):
@@ -189,6 +218,7 @@ def build_e4_artifact(
     equivalent = complete and all(row.get("equivalent") is True for row in pairs)
     return {
         "schema_version": E4_SCHEMA_VERSION,
+        "dataset_verification": dataset_verification,
         "checkpoint_sha256": checkpoint_sha256,
         "probe_sha256": probe_sha256,
         "eligibility_sha256": eligibility_sha256,
@@ -215,7 +245,7 @@ def build_e4_artifact(
 
 def read_e4_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
-    if payload.get("schema_version") != E4_SCHEMA_VERSION:
+    if payload.get("schema_version") not in (E4_SCHEMA_VERSION, E4_SCHEMA_VERSION.replace("/v2", "/v1")):
         raise ValueError("Unsupported E4 artifact schema")
     return payload
 
@@ -278,18 +308,26 @@ def build_e5_artifact(
         "paired_differences": paired_differences,
         "hypotheses": hypotheses,
         "complete": True,
+        "scientific_completion": False,
     }
 
 
 def read_e5_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
-    if payload.get("schema_version") != E5_SCHEMA_VERSION:
+    if payload.get("schema_version") not in (E5_SCHEMA_VERSION, E5_SCHEMA_VERSION.replace("/v2", "/v1")):
         raise ValueError("Unsupported E5 artifact schema")
     return payload
 
 
 def read_e6_artifact(path: str | Path) -> dict:
     payload = read_json_artifact(path)
-    if payload.get("schema_version") != E6_SCHEMA_VERSION:
+    if payload.get("schema_version") not in (E6_SCHEMA_VERSION, E6_SCHEMA_VERSION.replace("/v2", "/v1")):
         raise ValueError("Unsupported E6 artifact schema")
+    return payload
+
+
+def read_e7_artifact(path: str | Path) -> dict:
+    payload = read_json_artifact(path)
+    if payload.get("schema_version") != E7_SCHEMA_VERSION:
+        raise ValueError("Unsupported E7 artifact schema")
     return payload

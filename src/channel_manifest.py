@@ -12,7 +12,7 @@ EXPECTED_SAMPLE_ID = "sb_e1_sample_554d7f387c8baeea"
 EXPECTED_GROUP_COUNT = 32
 EXPECTED_CHANNELS_PER_GROUP = 12
 EXPECTED_CHANNEL_COUNT = 384
-EXPECTED_E2_SCHEMA = "causal_audit_e2_importance/v1"
+EXPECTED_E2_SCHEMA = "causal_audit_e2_importance/v2"
 EXPECTED_E2_CHANNEL_COUNT = 7552
 
 _GROUP_KIND_TO_HIDDEN_CONV = {
@@ -90,8 +90,11 @@ def validate_channel_manifest(
         raise ValueError("Manifest must contain 32 groups")
     if manifest.get("channels_per_group") != EXPECTED_CHANNELS_PER_GROUP:
         raise ValueError("Manifest must contain 12 channels per group")
-    if e2_artifact.get("schema_version") != EXPECTED_E2_SCHEMA:
+    if e2_artifact.get("schema_version") not in (EXPECTED_E2_SCHEMA, EXPECTED_E2_SCHEMA.replace("/v2", "/v1")):
         raise ValueError("Unsupported E2 artifact schema")
+    if e2_artifact["schema_version"] == EXPECTED_E2_SCHEMA:
+        from artifacts import validate_e2_contributions
+        validate_e2_contributions(e2_artifact["channels"], e2_artifact["eligible_image_count"])
     if e2_artifact.get("checkpoint_sha256") != checkpoint_sha256:
         raise ValueError("E2 checkpoint hash mismatch")
     if e2_artifact.get("probe_sha256") != probe_sha256:

@@ -9,6 +9,8 @@ METHODS = ("gxa", "activation", "l1", "taylor")
 
 
 def average_ranks(values: Sequence[float]) -> list[float]:
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Rank inputs must be finite")
     ordered = sorted((float(value), index) for index, value in enumerate(values))
     ranks = [0.0] * len(values)
     position = 0
@@ -48,6 +50,8 @@ def spearman_tie_aware(x: Sequence[float], y: Sequence[float]) -> dict:
 def kendall_tau_b(x: Sequence[float], y: Sequence[float]) -> dict:
     if len(x) != len(y) or len(x) < 2:
         raise ValueError("Kendall tau-b requires equal vectors with at least two values")
+    if not all(math.isfinite(float(v)) for v in (*x, *y)):
+        raise ValueError("Ordering inputs must be finite")
     concordant = discordant = ties_x = ties_y = ties_both = 0
     for i in range(len(x)):
         for j in range(i + 1, len(x)):
@@ -64,8 +68,17 @@ def kendall_tau_b(x: Sequence[float], y: Sequence[float]) -> dict:
             else:
                 discordant += 1
     denominator = math.sqrt((concordant + discordant + ties_x) * (concordant + discordant + ties_y))
-    value = 0.0 if denominator == 0.0 else (concordant - discordant) / denominator
-    return {"value": value, "concordant": concordant, "discordant": discordant, "ties_x": ties_x, "ties_y": ties_y, "ties_both": ties_both}
+    value = None if denominator == 0.0 else (concordant - discordant) / denominator
+    return {"value": value, "status": "not_identifiable" if value is None else "ok", "concordant": concordant, "discordant": discordant, "ties_x": ties_x, "ties_y": ties_y, "ties_both": ties_both}
+
+
+def pairwise_ordering_agreement(x: Sequence[float], y: Sequence[float]) -> dict:
+    counts = kendall_tau_b(x, y)
+    comparable = counts["concordant"] + counts["discordant"]
+    return {**{k: v for k, v in counts.items() if k not in ("value", "status")},
+            "total_pairs": len(x) * (len(x) - 1) // 2, "comparable_pairs": comparable,
+            "value": counts["concordant"] / comparable if comparable else None,
+            "status": "ok" if comparable else "no_comparable_pairs"}
 
 
 def _grouped(rows: Sequence[dict]) -> dict[str, list[dict]]:
@@ -85,15 +98,18 @@ def group_statistics(rows: Sequence[dict], methods: Sequence[str] = METHODS) -> 
             method_stats[method] = {
                 "spearman": spearman_tie_aware(importance, damage),
                 "kendall": kendall_tau_b(importance, damage),
+                "ordering_agreement": pairwise_ordering_agreement(importance, damage),
             }
-        result[group_id] = {"group_id": group_id, "channel_count": len(group_rows), "methods": method_stats}
+        result[group_id] = {"group_id": group_id, "channel_count": len(group_rows), "methods": method_stats,
+                            "stage": group_rows[0].get("stage"), "hidden_conv": group_rows[0].get("hidden_conv")}
     return result
 
 
 def macro_average(group_stats: dict[str, dict], statistic: str, method: str) -> dict:
-    values = [float(group["methods"][method][statistic]["value"]) for group in group_stats.values()]
+    values = [group["methods"][method][statistic]["value"] for group in group_stats.values()]
     flags = [bool(group["methods"][method][statistic].get("non_identifiable", False)) for group in group_stats.values()]
-    return {"value": sum(values) / len(values) if values else 0.0, "group_count": len(values), "non_identifiable_groups": sum(flags)}
+    valid = bool(values) and all(value is not None for value in values)
+    return {"value": sum(values) / len(values) if valid else None, "status": "ok" if valid else "not_identifiable", "group_count": len(values), "non_identifiable_groups": sum(flags), "undefined_groups": sum(value is None for value in values)}
 
 
 def paired_macro_differences(group_stats: dict[str, dict], methods: Sequence[str] = METHODS) -> dict[str, dict]:
@@ -120,30 +136,48 @@ def _residuals_by_group(rows: Sequence[dict], predictor: str, outcome: str) -> l
 
 
 def partial_rank_macro(rows: Sequence[dict], baseline: str) -> dict:
+    import numpy as np
+
     grouped = _grouped(rows)
-    values = []
-    non_identifiable = 0
-    for group_rows in grouped.values():
-        gxa = average_ranks([float(row["scores"]["gxa"]["raw"]) for row in group_rows])
-        damage = average_ranks([float(row["damage"]) for row in group_rows])
-        control = average_ranks([float(row["scores"][baseline]["raw"]) for row in group_rows])
-        control_mean = sum(control) / len(control)
-        gxa_mean = sum(gxa) / len(gxa)
-        damage_mean = sum(damage) / len(damage)
-        control_centered = [value - control_mean for value in control]
-        gxa_centered = [value - gxa_mean for value in gxa]
-        damage_centered = [value - damage_mean for value in damage]
-        denominator = sum(value * value for value in control_centered)
-        beta_gxa = 0.0 if denominator == 0.0 else sum(a * b for a, b in zip(control_centered, gxa_centered)) / denominator
-        beta_damage = 0.0 if denominator == 0.0 else sum(a * b for a, b in zip(control_centered, damage_centered)) / denominator
-        result = _pearson(
-            [value - beta_gxa * control for value, control in zip(gxa_centered, control_centered)],
-            [value - beta_damage * control for value, control in zip(damage_centered, control_centered)],
-        )
-        if denominator == 0.0:
-            non_identifiable += 1
-        values.append(result)
-    return {"value": sum(values) / len(values) if values else 0.0, "group_count": len(values), "non_identifiable_groups": non_identifiable}
+    if not grouped or any(len(group) < 2 for group in grouped.values()):
+        raise ValueError("Partial rank requires at least two observations per group")
+    q = len(grouped)
+    vectors, weights, indicators = [], [], []
+    for slot, group_rows in enumerate(grouped.values()):
+        n = len(group_rows)
+        vectors.extend(zip(*[(np.asarray(average_ranks([r["damage"] if m == "damage" else r["scores"][m]["raw"] for r in group_rows]), dtype=np.float64) - 1) / (n - 1)
+                             for m in ("gxa", "damage", baseline)]))
+        weights.extend([1 / (q * n)] * n)
+        indicators.extend([slot] * n)
+    z = np.asarray(vectors, dtype=np.float64)
+    w = np.asarray(weights)
+    root = np.sqrt(w)
+    X = np.column_stack((np.eye(q)[indicators], z[:, 2]))
+    A = root[:, None] * X
+    U, s, _ = np.linalg.svd(A, full_matrices=False)
+    n, p = A.shape
+    eps = np.finfo(np.float64).eps
+    rcond = max(n, p) * eps
+    cutoff = rcond * s[0]
+    rank = int(np.count_nonzero(s > cutoff))
+    v = root[:, None] * z[:, :2]
+    residual = (v - U[:, :rank] @ (U[:, :rank].T @ v)) / root[:, None]
+    residual -= np.sum(w[:, None] * residual, axis=0)
+    norms = np.linalg.norm(root[:, None] * residual, axis=0)
+    thresholds = 64 * eps * max(n, p) * np.maximum(1, np.linalg.norm(v, axis=0))
+    if not np.isfinite(residual).all():
+        raise ValueError("Non-finite weighted projection")
+    metadata = {"group_count": q, "numeric_convention": "weighted_svd_float64_v1", "design_rank": rank,
+                "design_n_columns": p, "singular_values": s.tolist(), "svd_rcond": rcond,
+                "svd_cutoff": float(cutoff), "rank_deficient": rank < p,
+                "baseline_redundant_after_group_effects": rank == q,
+                "residual_norms": norms.tolist(), "residual_thresholds": thresholds.tolist(),
+                "convention_applied": False}
+    for index, name in enumerate(("gxa", "damage")):
+        if norms[index] <= thresholds[index]:
+            return {**metadata, "value": None, "status": "non_identifiable", "reason": f"{name}_residual_zero_or_numerically_zero"}
+    value = float(np.sum(w * residual[:, 0] * residual[:, 1]) / np.prod(norms))
+    return {**metadata, "value": value, "status": "ok"}
 
 
 def percentile(values: Sequence[float], probability: float) -> float:

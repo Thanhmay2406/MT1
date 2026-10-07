@@ -23,6 +23,10 @@ def manifest_sha256(manifest: dict[str, Any]) -> str:
 
 
 def _file_record(path: Path, root: Path, split: str, kind: str) -> dict[str, Any]:
+    allowed = root.resolve() / "train" if split == "train" else root.resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(allowed) or any(part in ("valid", "test") for part in resolved.relative_to(root.resolve()).parts):
+        raise ValueError("File record would access a forbidden split")
     return {
         "path": path.relative_to(root).as_posix(),
         "split": split,
@@ -47,8 +51,10 @@ def build_dataset_manifest(dataset_root: str | Path, probe_path: str | Path) -> 
         raise FileNotFoundError("Dataset root and probe file are required")
     records: list[dict[str, Any]] = []
     splits: dict[str, dict[str, Any]] = {}
-    for split in ("train", "valid"):
+    for split in ("train",):
         split_root = root / split
+        if split_root.resolve() != root.resolve() / "train":
+            raise ValueError("TRAIN root must not alias another split")
         annotation_path = split_root / "_annotations.coco.json"
         if not split_root.is_dir() or not annotation_path.is_file():
             raise FileNotFoundError(f"Missing {split} split or COCO annotation file")
@@ -99,7 +105,11 @@ def build_dataset_manifest(dataset_root: str | Path, probe_path: str | Path) -> 
             "ordered_image_ids": [int(image["id"]) for image in probe.get("images", [])],
             "ordered_file_names": probe_names,
         },
-        "excluded_splits": ["test"],
+        "excluded_splits": ["valid", "test"],
+        "verification": {"verification_schema": "causal_audit_train_verification/v1", "scope": "full_train",
+                         "valid": "not_verified_access_prohibited", "test": "not_verified_access_prohibited",
+                         "full_package_byte_verification": False,
+                         "amendment_compliance": "unresolved_full_dataset_hash_requirement"},
         "file_records": sorted(records, key=lambda record: record["path"]),
     }
     manifest["manifest_sha256"] = manifest_sha256(manifest)
@@ -127,7 +137,7 @@ def validate_dataset_manifest(
     dataset_root: str | Path,
     probe: dict[str, Any],
     probe_path: str | Path | None = None,
-) -> None:
+) -> dict:
     if manifest.get("schema_version") != DATASET_MANIFEST_SCHEMA:
         raise ValueError("Unsupported dataset manifest schema")
     if manifest.get("manifest_id") != MANIFEST_ID:
@@ -135,16 +145,25 @@ def validate_dataset_manifest(
     if manifest.get("superseded_manifest_sha256") != SUPERSEDED_MANIFEST_SHA256:
         raise ValueError("Dataset manifest amendment does not supersede the frozen predecessor")
     root = Path(dataset_root)
+    if (root / "train").resolve() != root.resolve() / "train":
+        raise ValueError("TRAIN root must not alias another split")
     records = manifest.get("file_records")
     if not isinstance(records, list):
         raise ValueError("Dataset manifest file_records must be a list")
     paths = [record.get("path") for record in records]
     if len(paths) != len(set(paths)):
         raise ValueError("Dataset manifest contains duplicate paths")
-    if any(path.startswith("test/") for path in paths):
-        raise ValueError("Test split must not appear in scientific file records")
+    records = [r for r in records if r.get("split") == "train"]
+    paths = [r["path"] for r in records]
+    for relative in paths:
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts or path.parts[0] != "train":
+            raise ValueError("Unsafe TRAIN record path")
+        resolved = (root / path).resolve()
+        if not resolved.is_relative_to((root / "train").resolve()):
+            raise ValueError("TRAIN record escapes the allowed split")
     actual_paths = set()
-    for split in ("train", "valid"):
+    for split in ("train",):
         split_root = root / split
         annotation = split_root / "_annotations.coco.json"
         if not annotation.is_file():
@@ -170,6 +189,10 @@ def validate_dataset_manifest(
         raise ValueError("Probe path basename does not match manifest reference")
     if manifest["probe_reference"].get("sha256") != sha256_file(actual_probe_path):
         raise ValueError("Probe file changed from manifest reference")
+    return {"verification_schema": "causal_audit_train_verification/v1", "scope": "full_train",
+            "verified_paths": sorted(paths), "verified_probe_image_ids": [int(im["id"]) for im in probe["images"]],
+            "valid": "not_verified_access_prohibited", "test": "not_verified_access_prohibited",
+            "full_package_byte_verification": False, "amendment_compliance": "unresolved_full_dataset_hash_requirement"}
 
 
 def assert_dataset_manifest_sha256(path: str | Path, expected_sha256: str) -> str:

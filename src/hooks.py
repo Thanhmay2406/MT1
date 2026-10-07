@@ -19,11 +19,16 @@ class PostBNHookBank:
             self.activations[name] = output
             if output.requires_grad:
                 output.retain_grad()
+            # Keep the live pre-ReLU node; downstream in-place ops use a clone.
+            return output.clone()
 
         return capture
 
     def __enter__(self):
         modules = dict(self.model.named_modules())
+        missing = set(self.module_names) - set(modules)
+        if missing:
+            raise KeyError(f"Post-BN module not found: {sorted(missing)}")
         for name in self.module_names:
             if name not in modules:
                 raise KeyError(f"Post-BN module not found: {name}")

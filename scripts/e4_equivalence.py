@@ -16,7 +16,7 @@ from channel_manifest import FROZEN_CHANNEL_MANIFEST_SHA256, load_channel_manife
 from damage import compute_object_damage
 from dataset_manifest import DATASET_MANIFEST_SCHEMA, assert_dataset_manifest_sha256, load_dataset_manifest, validate_dataset_manifest
 from detector import load_detector_checkpoint
-from equivalence import E4_SAMPLE_SCHEMA, E4_TOLERANCE, PhysicalRemovalSpec, build_physical_removal_model, canonical_json_hash, compare_mask_and_physical
+from equivalence import E4_SAMPLE_SCHEMA, E4_TOLERANCE, PhysicalRemovalSpec, build_physical_removal_model, canonical_json_hash, compare_mask_and_physical, compare_equivalence_endpoints, capture_consumer_forward, select_e4_sample
 from identities import discover_structural_groups
 from inference import detection_from_prediction, image_to_tensor
 from integrity import assert_file_sha256, sha256_file
@@ -25,9 +25,9 @@ from matching import GroundTruthObject, match_detections_to_gt
 CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
 PROBE_SHA256 = "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d"
 DATASET_MANIFEST_SHA256 = "fce7c5bc78d606c641873220f124d4656f1c32d96c7ca1e2dbc7b0b4d4f6536f"
-E1_SCHEMA = "causal_audit_e1_eligibility/v1"
-E2_SCHEMA = "causal_audit_e2_importance/v1"
-E3_SCHEMA = "causal_audit_e3_damage/v1"
+E1_SCHEMA = "causal_audit_e1_eligibility/v2"
+E2_SCHEMA = "causal_audit_e2_importance/v2"
+E3_SCHEMA = "causal_audit_e3_damage/v2"
 EXPECTED_IMAGES = 300
 EXPECTED_ANNOTATIONS = 372
 MATCHING_IOU_THRESHOLD = 0.5
@@ -87,9 +87,12 @@ def _validate_sample(sample: dict, e3: dict, probe: dict, e1: dict, channel_ids:
     identity = {"channels": sample.get("channels"), "images": sample.get("images"), "sample_id": sample.get("sample_id")}
     if sample.get("sample_identity_sha256") != canonical_json_hash(identity):
         raise ValueError("E4 sample identity hash mismatch")
-    for field in ("checkpoint_sha256", "probe_sha256", "eligibility_sha256", "importance_sha256", "intervention_sha256", "dataset_manifest_sha256", "channel_manifest_sha256"):
+    for field in ("checkpoint_sha256", "probe_sha256", "dataset_manifest_sha256", "channel_manifest_sha256"):
         if sample.get(field) != hashes[field]:
             raise ValueError(f"E4 sample {field} mismatch")
+    for field in ("eligibility_sha256", "importance_sha256", "intervention_sha256"):
+        if field in sample and sample[field] != hashes[field]:
+            raise ValueError(f"E4 sample bound provenance mismatch: {field}")
     channels = sample.get("channels", [])
     images = sample.get("images", [])
     if len(channels) != 8 or len(images) != 16 or sample.get("channel_count") != 8 or sample.get("image_count") != 16:
@@ -106,8 +109,8 @@ def _validate_sample(sample: dict, e3: dict, probe: dict, e1: dict, channel_ids:
         image_id = int(row["image_id"])
         if image_id not in probe_by_id or row["file_name"] != probe_by_id[image_id]["file_name"]:
             raise ValueError("E4 sample image does not match probe")
-        if not e1_by_id[image_id].get("matches"):
-            raise ValueError("E4 sample image is not eligible in E1")
+    if [int(row["image_id"]) for row in images] != [int(im["id"]) for im in probe["images"][:16]]:
+        raise ValueError("E4 must use first 16 probe entries")
     return channels, images
 
 
@@ -133,7 +136,7 @@ def _preflight(args: argparse.Namespace) -> dict:
     if dataset_manifest.get("schema_version") != DATASET_MANIFEST_SCHEMA:
         raise ValueError("Unsupported dataset manifest schema")
     probe = _load_probe(paths["probe"])
-    validate_dataset_manifest(dataset_manifest, paths["images_root"].parent, probe, probe_path=paths["probe"])
+    dataset_verification = validate_dataset_manifest(dataset_manifest, paths["images_root"].parent, probe, probe_path=paths["probe"])
     e1 = read_json_artifact(paths["eligibility"])
     _validate_e1(e1, probe, checkpoint_sha256, probe_sha256)
     e2 = read_json_artifact(paths["importance"])
@@ -162,10 +165,18 @@ def _preflight(args: argparse.Namespace) -> dict:
         "channel_manifest_sha256": channel_manifest_sha256,
     }
     sample_channels, sample_images = _validate_sample(sample, e3, probe, e1, channel_ids, hashes)
+    expected_channels, _ = select_e4_sample(channel_manifest["entries"], probe)
+    expected_ids = [f"{r['producer_name']}|channel={int(r['local_channel_index'])}" for r in expected_channels]
+    if [r["canonical_id"] for r in sample_channels] != expected_ids:
+        raise ValueError("E4 channels differ from the preregistered raw-hash selector")
+    for actual, expected in zip(sample_channels, expected_channels):
+        for field in ("group_id", "producer_name", "norm_name", "consumer_name", "local_channel_index", "canonical_channel_id"):
+            if actual.get(field) != expected[field]:
+                raise ValueError(f"E4 sample channel metadata mismatch: {field}")
     missing_images = [row["file_name"] for row in sample_images if not (paths["images_root"] / row["file_name"]).is_file()]
     if missing_images:
         raise FileNotFoundError(f"Missing {len(missing_images)} selected E4 images")
-    return {"paths": paths, "probe": probe, "e1": e1, "e2": e2, "e3": e3, "e3_pairs": e3_pairs, "channel_manifest": channel_manifest, "sample": sample, "sample_channels": sample_channels, "sample_images": sample_images, "hashes": hashes, "channel_ids": channel_ids, "dataset_manifest": dataset_manifest}
+    return {"dataset_verification": dataset_verification, "paths": paths, "probe": probe, "e1": e1, "e2": e2, "e3": e3, "e3_pairs": e3_pairs, "channel_manifest": channel_manifest, "sample": sample, "sample_channels": sample_channels, "sample_images": sample_images, "hashes": hashes, "channel_ids": channel_ids, "dataset_manifest": dataset_manifest}
 
 
 def dry_run(args: argparse.Namespace) -> int:
@@ -195,8 +206,13 @@ def run_real(args: argparse.Namespace) -> int:
     from PIL import Image
 
     data = _preflight(args)
+    from determinism import configure_determinism
+    from intervention import InterventionSpec, snapshot_rng, restore_rng, model_state_digest
+    configure_determinism()
     device = _resolve_device(args.device)
     model, metadata = load_detector_checkpoint(data["paths"]["checkpoint"], device=device)
+    from inference import assert_replay_metadata
+    assert_replay_metadata(model, data["e1"].get("replay"), repo_root=REPO_ROOT, device=device)
     groups = {group.group_id: group for group in discover_structural_groups(model)}
     for entry in data["sample_channels"]:
         group = groups.get(entry["group_id"])
@@ -222,7 +238,13 @@ def run_real(args: argparse.Namespace) -> int:
     image_ids = [int(image["image_id"]) for image in data["sample_images"]]
     for channel_index, entry in enumerate(data["sample_channels"], start=1):
         spec = _build_spec(entry)
-        physical_model = build_physical_removal_model(model, spec).to(torch.device(device)).eval()
+        construction_rng = snapshot_rng()
+        try:
+            physical_model = build_physical_removal_model(model, spec).to(torch.device(device)).eval()
+        finally:
+            restore_rng(construction_rng)
+        width = dict(model.named_modules())[spec.norm_name].num_features
+        keep_indices = [i for i in range(width) if i != spec.channel_index]
         for image_index, image in enumerate(data["sample_images"], start=1):
             image_id = int(image["image_id"])
             key = (entry["canonical_id"], image_id)
@@ -231,13 +253,21 @@ def run_real(args: argparse.Namespace) -> int:
             row = {"canonical_id": entry["canonical_id"], "image_id": image_id, "file_name": image["file_name"]}
             try:
                 gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(image_id, [])]
-                with torch.inference_mode():
-                    prediction = physical_model([tensors[image_id]])[0]
+                mask_spec = InterventionSpec(spec.canonical_id, spec.group_id, spec.norm_name, spec.channel_index)
+                mask_prediction, mask_consumer = capture_consumer_forward(model, tensors[image_id], spec.consumer_name, mask_spec)
+                prediction, physical_consumer = capture_consumer_forward(physical_model, tensors[image_id], spec.consumer_name)
                 detections = [detection_from_prediction(prediction, index, metadata["label_to_category_id"]) for index in range(len(prediction["boxes"]))]
                 rematches = match_detections_to_gt(gt_objects, detections, MATCHING_IOU_THRESHOLD)
                 physical_damage = compute_object_damage(e1_by_image[image_id].get("matches", []), rematches)
+                mask_detections = [detection_from_prediction(mask_prediction, i, metadata["label_to_category_id"]) for i in range(len(mask_prediction["boxes"]))]
+                mask_matches = match_detections_to_gt(gt_objects, mask_detections, MATCHING_IOU_THRESHOLD)
+                mask_damage = compute_object_damage(e1_by_image[image_id].get("matches", []), mask_matches)
+                comparison = compare_mask_and_physical(mask_damage, physical_damage, E4_TOLERANCE)
+                endpoints = compare_equivalence_endpoints(mask_consumer, physical_consumer, mask_prediction, prediction,
+                                                         [m.to_dict() for m in mask_matches], [m.to_dict() for m in rematches], keep_indices)
                 mask_row = data["e3_pairs"][key]
-                comparison = compare_mask_and_physical(mask_row.get("object_damage", []), physical_damage, E4_TOLERANCE)
+                if mask_damage != mask_row.get("object_damage", []):
+                    raise RuntimeError("E4 mask replay differs from supplied E3")
                 row.update({
                     "status": "ok",
                     "original_matches": e1_by_image[image_id].get("matches", []),
@@ -247,11 +277,15 @@ def run_real(args: argparse.Namespace) -> int:
                     "physical_object_damage": physical_damage,
                     "physical_image_damage": sum(float(item["damage"]) for item in physical_damage) / len(physical_damage) if physical_damage else 0.0,
                     **comparison,
+                    **endpoints,
+                    "state_identity": {"dense": model_state_digest(model), "physical": model_state_digest(physical_model)},
+                    "forward_counts": {"equivalence_mask": 1, "equivalence_physical": 1},
                 })
             except Exception as error:
                 row.update({"status": "error", "error_type": type(error).__name__, "error": str(error), "equivalent": False})
             pair_rows[key] = row
             write_json_artifact(data["paths"]["output"], build_e4_artifact(
+                dataset_verification=data["dataset_verification"],
                 checkpoint_sha256=data["hashes"]["checkpoint_sha256"], probe_sha256=data["hashes"]["probe_sha256"], eligibility_sha256=data["hashes"]["eligibility_sha256"], importance_sha256=data["hashes"]["importance_sha256"], intervention_sha256=data["hashes"]["intervention_sha256"], dataset_manifest_sha256=data["hashes"]["dataset_manifest_sha256"], channel_manifest_sha256=data["hashes"]["channel_manifest_sha256"], e4_sample_sha256=sha256_file(data["paths"]["e4_sample"]), sample_id=data["sample"]["sample_id"], sample_identity_sha256=data["sample"]["sample_identity_sha256"], tolerance=E4_TOLERANCE, channel_ids=channel_ids, image_ids=image_ids, pairs=list(pair_rows.values()),
             ))
         del physical_model

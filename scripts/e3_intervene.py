@@ -30,8 +30,8 @@ from matching import GroundTruthObject, match_detections_to_gt
 EXPECTED_CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
 EXPECTED_PROBE_SHA256 = "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d"
 EXPECTED_DATASET_MANIFEST_SHA256 = "fce7c5bc78d606c641873220f124d4656f1c32d96c7ca1e2dbc7b0b4d4f6536f"
-EXPECTED_E1_SCHEMA = "causal_audit_e1_eligibility/v1"
-EXPECTED_E2_SCHEMA = "causal_audit_e2_importance/v1"
+EXPECTED_E1_SCHEMA = "causal_audit_e1_eligibility/v2"
+EXPECTED_E2_SCHEMA = "causal_audit_e2_importance/v2"
 EXPECTED_PROBE_IMAGES = 300
 EXPECTED_PROBE_ANNOTATIONS = 372
 MATCHING_IOU_THRESHOLD = 0.5
@@ -142,7 +142,7 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
         dataset_manifest = load_dataset_manifest(paths["dataset_manifest"])
         if dataset_manifest.get("schema_version") != DATASET_MANIFEST_SCHEMA:
             raise ValueError("Unsupported dataset manifest schema")
-        validate_dataset_manifest(
+        dataset_verification = validate_dataset_manifest(
             dataset_manifest,
             paths["images_root"].parent,
             json.loads(paths["probe"].read_text(encoding="utf-8")),
@@ -180,6 +180,7 @@ def _validate_inputs(args: argparse.Namespace, require_dataset: bool) -> dict:
         "importance_sha256": importance_sha256,
         "dataset_manifest_sha256": dataset_manifest_sha256,
         "dataset_manifest": dataset_manifest,
+        "dataset_verification": dataset_verification if dataset_manifest is not None else None,
     }
 
 
@@ -313,12 +314,20 @@ def _write_progress(data: dict, pairs: list[dict]) -> None:
         image_count=EXPECTED_PROBE_IMAGES,
         pairs=_ordered_pairs(data, pairs),
     )
+    artifact["dataset_verification"] = data.get("dataset_verification")
+    artifact["diagnostic_completion"] = False
     write_json_artifact(data["paths"]["output"], artifact)
 
 
 def run_real(args: argparse.Namespace) -> int:
     import torch
     from PIL import Image
+    from determinism import configure_determinism
+    from intervention import paired_loss_diagnostic, snapshot_rng, rng_states_equal
+    from damage import correspondence_diagnostics
+    from matching import legacy_independent_matches
+    from inference import target_for_image, detections_from_serialized_prediction
+    configure_determinism()
 
     run_started_at = time.perf_counter()
     preflight_started_at = time.perf_counter()
@@ -327,6 +336,8 @@ def run_real(args: argparse.Namespace) -> int:
     device = resolve_device(args.device)
     model_started_at = time.perf_counter()
     model, metadata = load_detector_checkpoint(data["paths"]["checkpoint"], device=device)
+    from inference import assert_replay_metadata
+    assert_replay_metadata(model, data["eligibility"].get("replay"), repo_root=REPO_ROOT, device=device)
     print(
         f"E3_MODEL_LOADED device={device} elapsed={_format_duration(time.perf_counter() - model_started_at)}",
         flush=True,
@@ -385,18 +396,32 @@ def run_real(args: argparse.Namespace) -> int:
             tensor = image_to_tensor(opened).to(torch.device(device))
         gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(image_id, [])]
         original_row = eligibility_by_image[image_id]
+        full_target = target_for_image(data["probe"], image_id, device, metadata["category_id_to_label"])
+        original_detections = detections_from_serialized_prediction(original_row["original_output"], metadata["label_to_category_id"])
+        original_legacy = legacy_independent_matches(gt_objects, original_detections)
         for spec_index, spec in enumerate(specs, start=1):
             key = (spec.canonical_id, int(image["id"]))
             if key in existing:
                 continue
             pair = {"canonical_id": spec.canonical_id, "image_id": int(image["id"]), "file_name": image["file_name"]}
+            counts = {"primary_intervention": 0, "loss_original": 0, "loss_intervened": 0}
+            pair["forward_counts"] = counts
             try:
                 before_digest = state_guard.digest
+                before_rng = snapshot_rng()
+                counts["primary_intervention"] += 1
                 prediction = run_intervened_forward(model, tensor, spec, state_guard=state_guard)
                 after_digest = state_guard.digest
                 detections = _detections_from_output(prediction, metadata["label_to_category_id"])
                 rematches = match_detections_to_gt(gt_objects, detections, MATCHING_IOU_THRESHOLD)
                 object_damage = compute_object_damage(original_row.get("matches", []), rematches)
+                diagnostics = correspondence_diagnostics(original_row.get("matches", []), rematches)
+                diagnostics["legacy_matching"] = {"scope": "legacy_eligible_gt_diagnostic_only",
+                    "original_matches": [m.to_dict() for m in original_legacy],
+                    "object_damage": compute_object_damage(original_legacy, legacy_independent_matches(gt_objects, detections))}
+                diagnostics["loss"] = (paired_loss_diagnostic(model, tensor, full_target, spec, forward_counts=counts) if original_row.get("matches")
+                                       else {"status": "inference_unavailable", "reason": "outside_eligible_image_domain"})
+                state_guard.verify(model)
                 pair.update({
                     "status": "ok",
                     "eligible_gt_ids": original_row.get("eligible_gt_ids", []),
@@ -407,7 +432,9 @@ def run_real(args: argparse.Namespace) -> int:
                     "state_digest_before": before_digest,
                     "state_digest_after": after_digest,
                     "state_restored": before_digest == after_digest,
-                    "rng_restored": True,
+                    "rng_restored": rng_states_equal(before_rng, snapshot_rng()),
+                    "diagnostics": diagnostics,
+                    "forward_counts": counts,
                 })
                 existing_by_channel[spec.canonical_id] += 1
             except Exception as error:
