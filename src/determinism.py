@@ -11,6 +11,7 @@ from typing import Any
 
 DETERMINISTIC_SEED = 20260905
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+AOT_AUTOGRAD_DONATED_BUFFER = False
 _STARTUP_HASHSEED = os.environ.get("PYTHONHASHSEED")
 
 
@@ -40,6 +41,12 @@ def configure_determinism(seed: int = DETERMINISTIC_SEED) -> dict[str, Any]:
         pass
 
     import torch
+    from torch._functorch import config as aot_config
+
+    if not hasattr(aot_config, "donated_buffer"):
+        raise RuntimeError("Torch does not expose the required retained-backward buffer policy")
+    # Compiled ROIAlign must preserve saved buffers across per-object backward calls.
+    aot_config.donated_buffer = AOT_AUTOGRAD_DONATED_BUFFER
 
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -52,10 +59,12 @@ def configure_determinism(seed: int = DETERMINISTIC_SEED) -> dict[str, Any]:
 
 def determinism_metadata(seed: int = DETERMINISTIC_SEED, device: str | None = None) -> dict[str, Any]:
     import torch
+    from torch._functorch import config as aot_config
 
     return {
         "seed": int(seed),
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "aot_autograd_donated_buffer": getattr(aot_config, "donated_buffer", None),
         "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
         "pythonhashseed_startup_verified": startup_hashseed_verified(seed),
         "pythonhashseed_verification": "startup_environment_and_hash_probe",
