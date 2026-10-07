@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Sequence
 
-from statistics import METHODS, group_statistics, macro_average, percentile, paired_macro_differences, partial_rank_macro
+from audit_statistics import METHODS, group_statistics, macro_average, percentile, paired_macro_differences, partial_rank_macro
 
 
 BOOTSTRAP_SEED = 20260905

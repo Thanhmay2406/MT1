@@ -17,7 +17,7 @@ from channel_manifest import FROZEN_CHANNEL_MANIFEST_SHA256, load_channel_manife
 from dataset_manifest import DATASET_MANIFEST_SCHEMA, assert_dataset_manifest_sha256, load_dataset_manifest, validate_dataset_manifest
 from integrity import assert_file_sha256, sha256_file
 from permutation import PERMUTATION_REPLICATES, PERMUTATION_SEED, permutation_tests
-from statistics import METHODS, group_statistics, macro_average, paired_macro_differences, partial_rank_macro
+from audit_statistics import METHODS, group_statistics, macro_average, paired_macro_differences, partial_rank_macro
 
 CHECKPOINT_SHA256 = "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0"
 PROBE_SHA256 = "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d"
@@ -209,7 +209,7 @@ def run_real(args: argparse.Namespace) -> int:
 
 
 def _diagnostic_statistics(data, rows):
-    from statistics import spearman_tie_aware
+    from audit_statistics import spearman_tie_aware
     results = {}
     for row in rows:
         ids = list(row["damage_by_image"])

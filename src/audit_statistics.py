@@ -1,3 +1,5 @@
+"""Study-specific rank statistics, separate from Python's statistics module."""
+
 from __future__ import annotations
 
 import math

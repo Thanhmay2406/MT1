@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Sequence
 
-from statistics import METHODS, partial_rank_macro
+from audit_statistics import METHODS, partial_rank_macro
 
 
 PERMUTATION_SEED = 20260905
