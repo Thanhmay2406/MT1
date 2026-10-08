@@ -30,6 +30,8 @@ def permutation_tests(
     baselines: Sequence[str] = BASELINES,
     replicates: int = PERMUTATION_REPLICATES,
     seed: int = PERMUTATION_SEED,
+    ledger_sink=None,
+    progress_callback=None,
 ) -> dict:
     if replicates < 1:
         raise ValueError("Permutation replicates must be positive")
@@ -41,7 +43,7 @@ def permutation_tests(
     observed = {baseline: partial_rank_macro(rows, baseline)["value"] for baseline in baselines}
     exceedances = {baseline: 0 for baseline in baselines}
     undefined = {baseline: 0 for baseline in baselines}
-    ledger = []
+    ledger = [] if ledger_sink is None else ledger_sink
     rng = random.Random(seed)
     for _ in range(replicates):
         permuted_rows = []
@@ -51,6 +53,8 @@ def permutation_tests(
             permuted_rows.extend({**row, "damage": damage} for row, damage in zip(group_rows, damages))
         results = {b: partial_rank_macro(permuted_rows, b) for b in baselines}
         ledger.append(results)
+        if progress_callback is not None:
+            progress_callback(len(ledger), replicates)
         for baseline in baselines:
             value = results[baseline]["value"]
             if value is None:

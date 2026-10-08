@@ -17,6 +17,8 @@ def hierarchical_bootstrap(
     methods: Sequence[str] = METHODS,
     replicates: int = BOOTSTRAP_REPLICATES,
     seed: int = BOOTSTRAP_SEED,
+    ledger_sink=None,
+    progress_callback=None,
 ) -> dict:
     if replicates < 1 or not eligible_image_ids:
         raise ValueError("Bootstrap requires positive replicates and eligible images")
@@ -35,7 +37,7 @@ def hierarchical_bootstrap(
     kendall = {method: [] for method in methods}
     paired = {method: [] for method in methods if method != "gxa"}
     partial = {method: [] for method in methods if method != "gxa"}
-    ledger = []
+    ledger = [] if ledger_sink is None else ledger_sink
     for row in rows:
         contributions = row.get("importance_by_image")
         if not contributions or any(str(i) not in contributions for i in eligible_image_ids):
@@ -72,6 +74,8 @@ def hierarchical_bootstrap(
             partial[method].append(replicate_stats["partial_rank"][method]["value"])
         ledger.append({"replicate": len(ledger), "image_ids": sampled_images, "original_group_ids": sampled_groups,
                        "channel_ids": [[r["canonical_id"] for r in draw] for draw in channel_draws], "statistics": replicate_stats})
+        if progress_callback is not None:
+            progress_callback(len(ledger), replicates)
     observed_groups = group_statistics(rows, methods)
     def intervals(collection, observed):
         result = {}

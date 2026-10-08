@@ -210,6 +210,7 @@ def compare_mask_and_physical(mask_damage: Sequence[dict], physical_damage: Sequ
         "max_utility_abs_difference": max_utility_difference,
         "max_damage_abs_difference": max_damage_difference,
         "equivalent": max_utility_difference <= tolerance and max_damage_difference <= tolerance,
+        "utility_damage_equivalent": max_utility_difference <= tolerance and max_damage_difference <= tolerance,
         "tolerance": tolerance,
     }
 

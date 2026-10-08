@@ -249,7 +249,7 @@ class ProgressReporter:
         if completed:
             self._write(f"E3_RESUME completed={completed}/{self.total}")
 
-    def pair_processed(self, completed: int, current: str) -> None:
+    def pair_processed(self, completed: int, current: str, *, ok: int | None = None, errors: int = 0) -> None:
         if completed < self.total and completed % self.progress_every != 0:
             return
         elapsed = self.clock() - self.started_at
@@ -259,7 +259,7 @@ class ProgressReporter:
         self.last_reported = completed
         self._write(
             "E3_PROGRESS "
-            f"completed={completed}/{self.total} "
+            f"completed={completed}/{self.total} ok={completed if ok is None else ok} errors={errors} "
             f"percent={100.0 * completed / self.total:.2f} "
             f"rate={rate:.2f} pairs/s "
             f"elapsed={_format_duration(elapsed)} "
@@ -279,7 +279,7 @@ class ProgressReporter:
             f"output={output} write_seconds={write_seconds:.2f}"
         )
 
-    def pair_error(self, canonical_id: str, image_id: int, error: Exception) -> None:
+    def pair_error(self, canonical_id: str, image_id: int, error: BaseException) -> None:
         self._write(
             f"E3_PAIR_ERROR canonical_id={canonical_id} image_id={image_id} "
             f"error_type={type(error).__name__} error={error}"
@@ -390,83 +390,97 @@ def run_real(args: argparse.Namespace) -> int:
     eligibility_by_image = {int(row["image_id"]): row for row in data["eligibility"]["images"]}
     newly_completed = 0
     last_checkpoint_count = len(existing)
-    for image in data["probe"]["images"]:
-        image_id = int(image["id"])
-        with Image.open(data["paths"]["images_root"] / image["file_name"]) as opened:
-            tensor = image_to_tensor(opened).to(torch.device(device))
-        gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(image_id, [])]
-        original_row = eligibility_by_image[image_id]
-        full_target = target_for_image(data["probe"], image_id, device, metadata["category_id_to_label"])
-        original_detections = detections_from_serialized_prediction(original_row["original_output"], metadata["label_to_category_id"])
-        original_legacy = legacy_independent_matches(gt_objects, original_detections)
-        for spec_index, spec in enumerate(specs, start=1):
-            key = (spec.canonical_id, int(image["id"]))
-            if key in existing:
-                continue
-            pair = {"canonical_id": spec.canonical_id, "image_id": int(image["id"]), "file_name": image["file_name"]}
-            counts = {"primary_intervention": 0, "loss_original": 0, "loss_intervened": 0}
-            pair["forward_counts"] = counts
+    try:
+        for image in data["probe"]["images"]:
+            image_id = int(image["id"])
+            with Image.open(data["paths"]["images_root"] / image["file_name"]) as opened:
+                tensor = image_to_tensor(opened).to(torch.device(device))
+            gt_objects = [GroundTruthObject(int(a["id"]), int(a["category_id"]), a["bbox"]) for a in annotations_by_image.get(image_id, [])]
+            original_row = eligibility_by_image[image_id]
+            full_target = target_for_image(data["probe"], image_id, device, metadata["category_id_to_label"])
+            original_detections = detections_from_serialized_prediction(original_row["original_output"], metadata["label_to_category_id"])
+            original_legacy = legacy_independent_matches(gt_objects, original_detections)
+            for spec_index, spec in enumerate(specs, start=1):
+                key = (spec.canonical_id, int(image["id"]))
+                if key in existing:
+                    continue
+                pair = {"canonical_id": spec.canonical_id, "image_id": int(image["id"]), "file_name": image["file_name"]}
+                counts = {"primary_intervention": 0, "loss_original": 0, "loss_intervened": 0}
+                pair["forward_counts"] = counts
+                try:
+                    before_digest = state_guard.digest
+                    before_rng = snapshot_rng()
+                    counts["primary_intervention"] += 1
+                    prediction = run_intervened_forward(model, tensor, spec, state_guard=state_guard)
+                    after_digest = state_guard.digest
+                    detections = _detections_from_output(prediction, metadata["label_to_category_id"])
+                    rematches = match_detections_to_gt(gt_objects, detections, MATCHING_IOU_THRESHOLD)
+                    object_damage = compute_object_damage(original_row.get("matches", []), rematches)
+                    diagnostics = correspondence_diagnostics(original_row.get("matches", []), rematches)
+                    diagnostics["legacy_matching"] = {"scope": "legacy_eligible_gt_diagnostic_only",
+                        "original_matches": [m.to_dict() for m in original_legacy],
+                        "object_damage": compute_object_damage(original_legacy, legacy_independent_matches(gt_objects, detections))}
+                    diagnostics["loss"] = (paired_loss_diagnostic(model, tensor, full_target, spec, forward_counts=counts) if original_row.get("matches")
+                                           else {"status": "inference_unavailable", "reason": "outside_eligible_image_domain"})
+                    state_guard.verify(model)
+                    pair.update({
+                        "status": "ok",
+                        "eligible_gt_ids": original_row.get("eligible_gt_ids", []),
+                        "original_matches": original_row.get("matches", []),
+                        "intervened_matches": [match.to_dict() for match in rematches],
+                        "object_damage": object_damage,
+                        "image_damage": aggregate_image_damage(object_damage),
+                        "state_digest_before": before_digest,
+                        "state_digest_after": after_digest,
+                        "state_restored": before_digest == after_digest,
+                        "rng_restored": rng_states_equal(before_rng, snapshot_rng()),
+                        "diagnostics": diagnostics,
+                        "forward_counts": counts,
+                    })
+                    existing_by_channel[spec.canonical_id] += 1
+                except BaseException as error:
+                    pair.update({"status": "error", "error_type": type(error).__name__, "error": str(error), "state_restored": False, "rng_restored": False})
+                    pair_rows[key] = pair
+                    reporter.pair_error(spec.canonical_id, image_id, error)
+                    raise
+                pair_rows[key] = pair
+                newly_completed += 1
+                processed_count = len(existing) + newly_completed
+                reporter.pair_processed(
+                    processed_count,
+                    f"image_id={image_id},channel={spec.canonical_id}",
+                    ok=processed_count, errors=0,
+                )
+                if (
+                    existing_by_channel[spec.canonical_id] == EXPECTED_PROBE_IMAGES
+                    and spec.canonical_id not in announced_channels
+                ):
+                    announced_channels.add(spec.canonical_id)
+                    reporter.channel_done(
+                        spec_index,
+                        len(specs),
+                        spec.canonical_id,
+                        processed_count,
+                    )
+                if newly_completed % args.checkpoint_every == 0:
+                    checkpoint_started_at = time.perf_counter()
+                    _write_progress(data, list(pair_rows.values()))
+                    last_checkpoint_count = processed_count
+                    reporter.checkpoint(
+                        processed_count,
+                        data["paths"]["output"],
+                        time.perf_counter() - checkpoint_started_at,
+                    )
+    except BaseException:
+        if pair_rows:
             try:
-                before_digest = state_guard.digest
-                before_rng = snapshot_rng()
-                counts["primary_intervention"] += 1
-                prediction = run_intervened_forward(model, tensor, spec, state_guard=state_guard)
-                after_digest = state_guard.digest
-                detections = _detections_from_output(prediction, metadata["label_to_category_id"])
-                rematches = match_detections_to_gt(gt_objects, detections, MATCHING_IOU_THRESHOLD)
-                object_damage = compute_object_damage(original_row.get("matches", []), rematches)
-                diagnostics = correspondence_diagnostics(original_row.get("matches", []), rematches)
-                diagnostics["legacy_matching"] = {"scope": "legacy_eligible_gt_diagnostic_only",
-                    "original_matches": [m.to_dict() for m in original_legacy],
-                    "object_damage": compute_object_damage(original_legacy, legacy_independent_matches(gt_objects, detections))}
-                diagnostics["loss"] = (paired_loss_diagnostic(model, tensor, full_target, spec, forward_counts=counts) if original_row.get("matches")
-                                       else {"status": "inference_unavailable", "reason": "outside_eligible_image_domain"})
-                state_guard.verify(model)
-                pair.update({
-                    "status": "ok",
-                    "eligible_gt_ids": original_row.get("eligible_gt_ids", []),
-                    "original_matches": original_row.get("matches", []),
-                    "intervened_matches": [match.to_dict() for match in rematches],
-                    "object_damage": object_damage,
-                    "image_damage": aggregate_image_damage(object_damage),
-                    "state_digest_before": before_digest,
-                    "state_digest_after": after_digest,
-                    "state_restored": before_digest == after_digest,
-                    "rng_restored": rng_states_equal(before_rng, snapshot_rng()),
-                    "diagnostics": diagnostics,
-                    "forward_counts": counts,
-                })
-                existing_by_channel[spec.canonical_id] += 1
-            except Exception as error:
-                pair.update({"status": "error", "error_type": type(error).__name__, "error": str(error), "state_restored": False, "rng_restored": False})
-                reporter.pair_error(spec.canonical_id, image_id, error)
-            pair_rows[key] = pair
-            newly_completed += 1
-            processed_count = len(existing) + newly_completed
-            reporter.pair_processed(
-                processed_count,
-                f"image_id={image_id},channel={spec.canonical_id}",
-            )
-            if (
-                existing_by_channel[spec.canonical_id] == EXPECTED_PROBE_IMAGES
-                and spec.canonical_id not in announced_channels
-            ):
-                announced_channels.add(spec.canonical_id)
-                reporter.channel_done(
-                    spec_index,
-                    len(specs),
-                    spec.canonical_id,
-                    processed_count,
-                )
-            if newly_completed % args.checkpoint_every == 0:
-                checkpoint_started_at = time.perf_counter()
                 _write_progress(data, list(pair_rows.values()))
-                last_checkpoint_count = processed_count
-                reporter.checkpoint(
-                    processed_count,
-                    data["paths"]["output"],
-                    time.perf_counter() - checkpoint_started_at,
-                )
+                ok = sum(row.get("status") == "ok" for row in pair_rows.values())
+                errors = sum(row.get("status") == "error" for row in pair_rows.values())
+                print(f"E3_STOP processed={len(pair_rows)} ok={ok} errors={errors} complete=false", flush=True)
+            except Exception as save_error:
+                print(f"E3_SAVE_FAILED {type(save_error).__name__}: {save_error}", flush=True)
+        raise
     processed_count = len(existing) + newly_completed
     if last_checkpoint_count != processed_count:
         checkpoint_started_at = time.perf_counter()
@@ -478,7 +492,7 @@ def run_real(args: argparse.Namespace) -> int:
         )
     final = read_e3_artifact(data["paths"]["output"])
     if not final["complete"]:
-        raise RuntimeError(f"E3 incomplete: {final['completed_pair_count']}/{final['expected_pair_count']} pairs")
+        raise RuntimeError(f"E3 incomplete: processed={final['completed_pair_count']}/{final['expected_pair_count']} ok={final['ok_pair_count']} errors={final['error_pair_count']}")
     print("E3_OK")
     print(f"output={data['paths']['output']}")
     print(f"completed_pair_count={final['completed_pair_count']}")

@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
 from determinism import CUBLAS_WORKSPACE_CONFIG, DETERMINISTIC_SEED
 from channel_manifest import FROZEN_CHANNEL_MANIFEST_SHA256
 from dataset_manifest import assert_dataset_manifest_sha256
+from artifacts import write_json_artifact
 from integrity import assert_file_sha256, sha256_file
 from reproducibility import canonical_json_hash, runtime_fingerprint
 
@@ -53,7 +54,7 @@ def main() -> int:
     }
     payload["manifest_sha256"] = canonical_json_hash(payload)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_artifact(output, payload)
     print("ENVIRONMENT_MANIFEST_OK")
     print(f"output={output}")
     print(f"manifest_sha256={payload['manifest_sha256']}")

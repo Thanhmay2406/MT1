@@ -206,7 +206,9 @@ def compute_scores(model, probe, eligibility, groups, images_root, device, label
     norm_names = [group.norm_name for group in groups]
     eligible_rows = [row for row in eligibility["images"] if row["matches"]]
 
-    for row in eligible_rows:
+    if not eligible_rows:
+        raise ValueError("E2 cannot score a zero-eligible image domain")
+    for image_index, row in enumerate(eligible_rows, start=1):
         image_id = int(row["image_id"])
         image_path = Path(images_root) / row["file_name"]
         with Image.open(image_path) as opened:
@@ -270,6 +272,8 @@ def compute_scores(model, probe, eligibility, groups, images_root, device, label
         finally:
             _restore_rng(rng_state)
             model.eval()
+        if image_index % 10 == 0 or image_index == len(eligible_rows):
+            print(f"E2_PROGRESS images={image_index}/{len(eligible_rows)}", flush=True)
 
     rows = []
     for group in groups:
@@ -348,6 +352,8 @@ def run_real(args: argparse.Namespace) -> int:
     validate_image_files(probe, images_root)
     eligibility = read_json_artifact(eligibility_path)
     validate_eligibility(eligibility, probe, checkpoint_sha256, probe_sha256)
+    if not eligibility["eligible_image_count"]:
+        raise ValueError("E2 cannot score a zero-eligible image domain")
     device = resolve_device(args.device)
     determinism = determinism_metadata(args.seed, device=device)
     model, metadata = load_detector_checkpoint(checkpoint, device=device)

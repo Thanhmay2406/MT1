@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -11,7 +12,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from artifacts import build_e5_artifact, read_e3_artifact, read_e4_artifact, read_json_artifact, write_json_artifact
+from artifacts import DiskLedger, build_e5_artifact, read_e3_artifact, read_e4_artifact, read_json_artifact, write_json_artifact
 from bootstrap import BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED, hierarchical_bootstrap
 from channel_manifest import FROZEN_CHANNEL_MANIFEST_SHA256, load_channel_manifest, validate_channel_manifest
 from dataset_manifest import DATASET_MANIFEST_SCHEMA, assert_dataset_manifest_sha256, load_dataset_manifest, validate_dataset_manifest
@@ -151,14 +152,22 @@ def _build_channel_rows(data: dict) -> tuple[list[dict], list[int]]:
     return rows, eligible_image_ids
 
 
-def _analyze(data: dict, bootstrap_replicates: int, permutation_replicates: int) -> dict:
-    channel_rows, eligible_image_ids = _build_channel_rows(data)
+def _analyze(data: dict | None, bootstrap_replicates: int, permutation_replicates: int,
+             *, prepared_rows=None, bootstrap_ledger=None, permutation_ledger=None,
+             bootstrap_progress=None, permutation_progress=None) -> dict:
+    channel_rows, eligible_image_ids = prepared_rows if prepared_rows is not None else _build_channel_rows(data)
     group_stats = group_statistics(channel_rows, METHODS)
     macro_stats = {method: {"spearman": macro_average(group_stats, "spearman", method), "kendall": macro_average(group_stats, "kendall", method)} for method in METHODS}
     paired = paired_macro_differences(group_stats, METHODS)
     hypotheses = {"H1": {"method": "gxa", "null": "macro_spearman <= 0", "observed": macro_stats["gxa"]["spearman"]["value"], "supported": False, "requires": "bootstrap_ci_lower > 0 and E6 reproducibility PASS"}, "H2": {"baseline": "l1", "observed": partial_rank_macro(channel_rows, "l1")["value"]}, "H3": {"baseline": "taylor", "observed": partial_rank_macro(channel_rows, "taylor")["value"]}, "H4": {"baseline": "activation", "observed": partial_rank_macro(channel_rows, "activation")["value"]}}
-    bootstrap = hierarchical_bootstrap(channel_rows, eligible_image_ids, replicates=bootstrap_replicates, seed=BOOTSTRAP_SEED)
-    permutation = permutation_tests(channel_rows, replicates=permutation_replicates, seed=PERMUTATION_SEED)
+    if bootstrap_progress is not None and hasattr(bootstrap_progress, "reset"):
+        bootstrap_progress.reset()
+    bootstrap = hierarchical_bootstrap(channel_rows, eligible_image_ids, replicates=bootstrap_replicates, seed=BOOTSTRAP_SEED,
+                                      ledger_sink=bootstrap_ledger, progress_callback=bootstrap_progress)
+    if permutation_progress is not None and hasattr(permutation_progress, "reset"):
+        permutation_progress.reset()
+    permutation = permutation_tests(channel_rows, replicates=permutation_replicates, seed=PERMUTATION_SEED,
+                                    ledger_sink=permutation_ledger, progress_callback=permutation_progress)
     for hypothesis, baseline in (("H2", "l1"), ("H3", "taylor"), ("H4", "activation")):
         hypotheses[hypothesis]["permutation"] = permutation["statistics"][baseline]
         hypotheses[hypothesis]["partial_rank"] = partial_rank_macro(channel_rows, baseline)
@@ -187,25 +196,65 @@ def dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _progress_callback(label: str, every: int):
+    started = time.perf_counter()
+    def reset():
+        nonlocal started
+        started = time.perf_counter()
+    def report(completed, total):
+        if completed % every and completed != total:
+            return
+        elapsed = time.perf_counter() - started
+        rate = completed / elapsed if elapsed > 0 else 0.0
+        eta = (total - completed) / rate if rate else 0.0
+        print(f"E5_{label}_PROGRESS completed={completed}/{total} elapsed={elapsed:.2f}s rate={rate:.2f}/s eta={eta:.2f}s", flush=True)
+    report.reset = reset
+    return report
+
+
 def run_real(args: argparse.Namespace) -> int:
     data = _preflight(args)
-    analysis = _analyze(data, args.bootstrap_replicates, args.permutation_replicates)
-    artifact = build_e5_artifact(**data["hashes"], equivalence_status=data["e4"]["equivalence_status"], matching_iou_threshold=MATCHING_IOU_THRESHOLD, eligible_image_count=data["e2"]["eligible_image_count"], eligible_instance_count=data["e2"]["eligible_instance_count"], **analysis)
-    artifact["dataset_verification"] = data["dataset_verification"]
-    artifact["diagnostics"] = _diagnostic_statistics(data, analysis["channel_rows"])
-    intervals = [*analysis["bootstrap"]["statistics"].values(), *analysis["bootstrap"]["kendall"].values(),
-                 *analysis["bootstrap"]["paired_differences"].values(), *analysis["bootstrap"]["partial_rank"].values()]
-    artifact["inference_complete"] = all(ci["status"] == "ok" for ci in intervals) and analysis["permutation"]["family_status"] == "complete"
-    artifact["scientific_completion"] = False
-    artifact["protocol_compliance"] = "requires_recorded_clarifications_and_provenance_review"
-    write_json_artifact(data["paths"]["output"], artifact)
+    prepared = _build_channel_rows(data)
+    diagnostics = _diagnostic_statistics(data, prepared[0])
+    output = data["paths"]["output"]
+    metadata = dict(data["hashes"], equivalence_status=data["e4"]["equivalence_status"],
+                    matching_iou_threshold=MATCHING_IOU_THRESHOLD,
+                    eligible_image_count=data["e2"]["eligible_image_count"],
+                    eligible_instance_count=data["e2"]["eligible_instance_count"])
+    verification = data["dataset_verification"]
+    data.clear()  # Keep only sampled channel contributions, damage, diagnostics and provenance.
+    if metadata["equivalence_status"] != "equivalent":
+        print("E5_STRUCTURAL_INTERPRETATION_UNAVAILABLE equivalence_status=" + metadata["equivalence_status"], flush=True)
+    with DiskLedger(output.parent) as bootstrap_ledger, DiskLedger(output.parent) as permutation_ledger:
+        analysis = _analyze(None, args.bootstrap_replicates, args.permutation_replicates,
+                            prepared_rows=prepared, bootstrap_ledger=bootstrap_ledger,
+                            permutation_ledger=permutation_ledger,
+                            bootstrap_progress=_progress_callback("BOOTSTRAP", 100),
+                            permutation_progress=_progress_callback("PERMUTATION", 1000))
+        artifact = build_e5_artifact(**metadata, **analysis)
+        artifact["dataset_verification"] = verification
+        artifact["diagnostics"] = diagnostics
+        _finish_artifact(output, artifact, analysis)
     print("E5_OK")
-    print(f"output={data['paths']['output']}")
+    print(f"output={output}")
     print("group_count=32")
     print("channel_count=384")
     print(f"bootstrap_replicates={args.bootstrap_replicates}")
     print(f"permutation_replicates={args.permutation_replicates}")
     return 0
+
+
+def _finish_artifact(output, artifact, analysis):
+    intervals = [*analysis["bootstrap"]["statistics"].values(), *analysis["bootstrap"]["kendall"].values(),
+                 *analysis["bootstrap"]["paired_differences"].values(), *analysis["bootstrap"]["partial_rank"].values()]
+    artifact["inference_complete"] = all(ci["status"] == "ok" for ci in intervals) and analysis["permutation"]["family_status"] == "complete"
+    artifact["scientific_completion"] = False
+    artifact["protocol_compliance"] = "requires_recorded_clarifications_and_provenance_review"
+    print(f"E5_STATUS inference_complete={artifact['inference_complete']} undefined_intervals={sum(ci['status'] != 'ok' for ci in intervals)} permutation_family={analysis['permutation']['family_status']} scientific_completion=false", flush=True)
+    print("E5_SERIALIZE_START", flush=True)
+    started = time.perf_counter()
+    write_json_artifact(output, artifact)
+    print(f"E5_SERIALIZE_DONE elapsed={time.perf_counter() - started:.2f}s", flush=True)
 
 
 def _diagnostic_statistics(data, rows):

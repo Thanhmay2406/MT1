@@ -278,6 +278,7 @@ def run_real(args: argparse.Namespace) -> int:
                     "physical_image_damage": sum(float(item["damage"]) for item in physical_damage) / len(physical_damage) if physical_damage else 0.0,
                     **comparison,
                     **endpoints,
+                    "utility_damage_equivalent": comparison["equivalent"],
                     "state_identity": {"dense": model_state_digest(model), "physical": model_state_digest(physical_model)},
                     "forward_counts": {"equivalence_mask": 1, "equivalence_physical": 1},
                 })

@@ -116,7 +116,7 @@ def predict_probe(model, probe: dict, images_root: str | Path, device: str, labe
 
     images_root = Path(images_root)
     predictions_by_image_id: dict[int, list[Detection]] = {}
-    for image in probe["images"]:
+    for image_index, image in enumerate(probe["images"], start=1):
         image_path = images_root / image["file_name"]
         with Image.open(image_path) as opened:
             predictions_by_image_id[int(image["id"])] = run_detector(
@@ -127,4 +127,6 @@ def predict_probe(model, probe: dict, images_root: str | Path, device: str, labe
                 raw_outputs=raw_outputs,
                 image_id=int(image["id"]),
             )
+        if image_index % 10 == 0 or image_index == len(probe["images"]):
+            print(f"E1_PROGRESS images={image_index}/{len(probe['images'])}", flush=True)
     return predictions_by_image_id

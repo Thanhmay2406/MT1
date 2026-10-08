@@ -14,6 +14,77 @@ E4_SCHEMA_VERSION = "causal_audit_e4_equivalence/v2"
 E5_SCHEMA_VERSION = "causal_audit_e5_statistics/v2"
 E6_SCHEMA_VERSION = "causal_audit_e6_reproducibility/v2"
 E7_SCHEMA_VERSION = "causal_audit_e7_final_report/v1"
+_LEAF_ENCODER = json.JSONEncoder(allow_nan=False)
+
+
+class DiskLedger:
+    """Temporary, sequential JSON records; never a resumable artifact."""
+
+    def __init__(self, directory: str | Path):
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        self._file = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory, prefix=".mt1-ledger-", delete=False
+        )
+        self.path = Path(self._file.name)
+        self._count = 0
+
+    def append(self, record: Any) -> None:
+        self._file.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+        self._count += 1
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self):
+        self._file.flush()
+        with self.path.open(encoding="utf-8") as stream:
+            for line in stream:
+                yield json.loads(line)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self._file.close()
+        finally:
+            self.path.unlink(missing_ok=True)
+
+
+def _json_chunks(value: Any, level: int = 0):
+    """Pretty-print without building a whole-payload string or disk ledger list."""
+    pad = "  " * level
+    child_pad = "  " * (level + 1)
+    if isinstance(value, dict):
+        if not value:
+            yield "{}"
+            return
+        yield "{\n"
+        for index, key in enumerate(sorted(value)):
+            if index:
+                yield ",\n"
+            if isinstance(key, str):
+                encoded_key = _LEAF_ENCODER.encode(key)
+            elif key is None or isinstance(key, (bool, int, float)):
+                encoded_key = _LEAF_ENCODER.encode(_LEAF_ENCODER.encode(key))
+            else:
+                raise TypeError(f"JSON keys must be str, int, float, bool or None: {type(key).__name__}")
+            yield child_pad + encoded_key + ": "
+            yield from _json_chunks(value[key], level + 1)
+        yield "\n" + pad + "}"
+    elif isinstance(value, (list, tuple, DiskLedger)):
+        if not len(value):
+            yield "[]"
+            return
+        yield "[\n"
+        for index, item in enumerate(value):
+            if index:
+                yield ",\n"
+            yield child_pad
+            yield from _json_chunks(item, level + 1)
+        yield "\n" + pad + "]"
+    else:
+        yield _LEAF_ENCODER.encode(value)
 
 
 def write_json_artifact(path: str | Path, payload: Any) -> None:
@@ -21,13 +92,19 @@ def write_json_artifact(path: str | Path, payload: Any) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if hasattr(payload, "to_dict"):
         payload = payload.to_dict()
-    text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, delete=False) as handle:
-        temporary = Path(handle.name)
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, target)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            for chunk in _json_chunks(payload):
+                handle.write(chunk)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def read_json_artifact(path: str | Path) -> Any:
@@ -166,6 +243,8 @@ def build_e3_artifact(
         "image_count": int(image_count),
         "expected_pair_count": expected_pair_count,
         "completed_pair_count": len(pairs),
+        "ok_pair_count": sum(row.get("status") == "ok" for row in pairs),
+        "error_pair_count": sum(row.get("status") == "error" for row in pairs),
         "complete": len(pairs) == expected_pair_count and all(row.get("status") == "ok" for row in pairs),
         "channel_ids": channel_ids,
         "pairs": pairs,

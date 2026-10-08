@@ -11,7 +11,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from artifacts import read_json_artifact
+from artifacts import read_json_artifact, write_json_artifact
 from channel_manifest import FROZEN_CHANNEL_MANIFEST_SHA256, load_channel_manifest
 from equivalence import E4_SAMPLE_SCHEMA, canonical_json_hash, select_e4_sample
 from integrity import assert_file_sha256
@@ -87,7 +87,7 @@ def main() -> int:
     manifest["sample_identity_sha256"] = canonical_json_hash(identity)
     manifest["sample_sha256"] = canonical_json_hash(_canonical_payload(manifest))
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_artifact(output, manifest)
     print("E4_SAMPLE_FROZEN")
     print(f"output={output}")
     print(f"channel_count={manifest['channel_count']}")
